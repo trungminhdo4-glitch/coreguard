@@ -1,0 +1,8 @@
+/build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.nativecodeanalysis.xml
+__pycache__/
+*.pyc
