@@ -1,0 +1,42 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 Release verification
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout public source
+        uses: actions/checkout@v4
+
+      - name: Configure, build, and verify with MSVC x64
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (echo MSVC x64 installation not found& exit /b 1)
+          set "COREGUARD_VCVARS=%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist "%COREGUARD_VCVARS%" (echo vcvars64.bat not found& exit /b 1)
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          if errorlevel 1 exit /b 1
+          cmake -S . -B build -A x64 -DCOREGUARD_VERSION=0.1.0
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release --parallel --verbose
+          if errorlevel 1 exit /b 1
+          set "COREGUARD_EXE=%GITHUB_WORKSPACE%\build\Release\coreguard.exe"
+          if not exist "%COREGUARD_EXE%" (echo Release executable not found& exit /b 1)
+          python -m unittest discover -s tests -p "test_*.py" -v
+          if errorlevel 1 exit /b 1
+          python tests\verification.py --exe "%COREGUARD_EXE%"
