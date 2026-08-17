@@ -1,5 +1,7 @@
 # Coreguard
 
+[![Windows CI](https://github.com/trungminhdo4-glitch/coreguard/actions/workflows/windows-ci.yml/badge.svg)](https://github.com/trungminhdo4-glitch/coreguard/actions/workflows/windows-ci.yml)
+
 Coreguard is a small Windows-native C execution layer. It starts one
 executable directly, places it in a Windows Job Object before resuming it, and
 reports bounded execution results as a C API or as a command-line JSON result.

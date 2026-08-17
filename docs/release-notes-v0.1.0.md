@@ -1,7 +1,7 @@
 # Coreguard v0.1.0
 
-Coreguard v0.1.0 is a Windows x64/MSVC static-library source release
-candidate. It provides a direct executable runner with Windows Job Object
+Coreguard v0.1.0 is a Windows x64/MSVC static-library source release.
+It provides a direct executable runner with Windows Job Object
 containment, bounded timeout handling, resource limits, structured CLI output,
 and C/C++ consumer examples.
 
