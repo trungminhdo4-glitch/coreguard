@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout public source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Configure, build, and verify with MSVC x64
         shell: cmd
