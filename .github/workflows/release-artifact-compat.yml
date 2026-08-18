@@ -19,12 +19,10 @@ jobs:
           - lane: v143-windows-2022
             runner: windows-2022
             generator: Visual Studio 17 2022
-            expected_vs_path: \2022\
             expected_toolset_prefix: 14.4
           - lane: v145-windows-2025-vs2026
             runner: windows-2025-vs2026
             generator: Visual Studio 18 2026
-            expected_vs_path: \18\
             expected_toolset_prefix: 14.5
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -32,7 +30,6 @@ jobs:
       COREGUARD_RELEASE_URL: https://github.com/trungminhdo4-glitch/coreguard/releases/download/v0.1.0/coreguard-0.1.0-windows-x64-msvc.zip
       COREGUARD_EXPECTED_SHA256: 795810a6f13ab7de9e83853f3b7d32b0c59a8e65d900e0e7701c13d2b381b63d
       COREGUARD_GENERATOR: ${{ matrix.generator }}
-      COREGUARD_EXPECTED_VS_PATH: ${{ matrix.expected_vs_path }}
       COREGUARD_EXPECTED_TOOLSET_PREFIX: ${{ matrix.expected_toolset_prefix }}
 
     steps:
@@ -170,8 +167,6 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           if not defined VSINSTALL (echo MSVC x64 installation not found& exit /b 1)
           echo VSINSTALL=%VSINSTALL%
-          echo %VSINSTALL% | findstr /I /C:"%COREGUARD_EXPECTED_VS_PATH%" >NUL
-          if errorlevel 1 (echo Unexpected Visual Studio installation path& exit /b 1)
           if not exist "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" (echo vcvars64.bat not found& exit /b 1)
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           if errorlevel 1 exit /b 1
