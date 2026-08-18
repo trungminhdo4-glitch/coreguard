@@ -2,6 +2,9 @@ name: Published Release Artifact Compatibility
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - evidence/release-artifact-compat-v010
 
 permissions:
   contents: read
