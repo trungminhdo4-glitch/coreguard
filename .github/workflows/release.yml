@@ -1,0 +1,132 @@
+name: Future Release Trust
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the already-selected tag as a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+# Pull requests cannot enter this workflow.  A tag push builds and attests but
+# does not publish; publication requires a manual dispatch plus the protected
+# release-publication environment.
+permissions: {}
+
+jobs:
+  build-attest:
+    name: Build, verify, package, and attest release
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TIMESTAMP: ${{ github.run_started_at }}
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Verify tag and checkout identity
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -notmatch '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release workflow requires an exact vX.Y.Z tag ref: $env:GITHUB_REF"
+          }
+          if ($env:RELEASE_TAG -eq "v0.1.0") {
+            throw "v0.1.0 is historical and is intentionally excluded from future provenance"
+          }
+          python scripts/release_trust.py validate-tag --tag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:GITHUB_SHA) {
+            throw "Checked-out commit $head does not match workflow SHA $env:GITHUB_SHA"
+          }
+          Write-Output "Release tag: $env:RELEASE_TAG"
+          Write-Output "Release commit: $head"
+
+      - name: Configure, build, and run existing verification
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (echo MSVC x64 installation not found& exit /b 1)
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          if errorlevel 1 exit /b 1
+          cmake -S . -B build -A x64 -DCOREGUARD_VERSION=%RELEASE_TAG:~1%
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release --parallel --verbose
+          if errorlevel 1 exit /b 1
+          python -m unittest discover -s tests -p "test_*.py" -v
+          if errorlevel 1 exit /b 1
+          python tests\verification.py --exe build\Release\coreguard.exe
+          if errorlevel 1 exit /b 1
+
+      - name: Package and create release evidence
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (echo MSVC x64 installation not found& exit /b 1)
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          if errorlevel 1 exit /b 1
+          cpack --config build\CPackConfig.cmake -C Release
+          if errorlevel 1 exit /b 1
+          if not exist release mkdir release
+          copy /Y "build\coreguard-%RELEASE_TAG:~1%-windows-x64-msvc.zip" release\ >NUL
+          if errorlevel 1 exit /b 1
+          python scripts\release_trust.py validate-build --tag "%RELEASE_TAG%" --build-dir build --artifact "release\coreguard-%RELEASE_TAG:~1%-windows-x64-msvc.zip"
+          if errorlevel 1 exit /b 1
+          python scripts\release_trust.py write-evidence --tag "%RELEASE_TAG%" --commit "%GITHUB_SHA%" --artifact "release\coreguard-%RELEASE_TAG:~1%-windows-x64-msvc.zip" --output-dir release --timestamp "%RELEASE_TIMESTAMP%"
+          if errorlevel 1 exit /b 1
+
+      - name: Attest release ZIP and checksum manifest
+        uses: actions/attest@v4.2.1
+        with:
+          subject-path: |
+            ${{ github.workspace }}/release/coreguard-*.zip
+            ${{ github.workspace }}/release/SHA256SUMS
+            ${{ github.workspace }}/release/release-manifest.json
+
+      - name: Upload release evidence for owner-gated publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: coreguard-${{ github.ref_name }}-release-evidence
+          path: release/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Owner-gated GitHub Release publication
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}
+    needs: build-attest
+    runs-on: ubuntu-latest
+    environment:
+      name: release-publication
+    permissions:
+      contents: write
+    steps:
+      - name: Download attested release evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: coreguard-${{ github.ref_name }}-release-evidence
+          path: release
+
+      - name: Publish existing tag without creating a tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            --title "Coreguard ${{ github.ref_name }}" \
+            --generate-notes \
+            release/*
