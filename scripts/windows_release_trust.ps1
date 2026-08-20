@@ -54,6 +54,7 @@ $vsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer
 if (-not (Test-Path -LiteralPath $vsWhere)) {
     throw "vswhere.exe was not found: $vsWhere"
 }
+$LASTEXITCODE = 0
 $vsInstall = (& $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
     Select-Object -First 1)
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstall)) {
@@ -69,6 +70,7 @@ function Invoke-DeveloperCommand {
     param([Parameter(Mandatory = $true)][string]$CommandLine)
 
     Write-Host "Executing MSVC developer command: $CommandLine"
+    $LASTEXITCODE = 0
     & $env:ComSpec /d /s /c $CommandLine
     if ($LASTEXITCODE -ne 0) {
         throw "MSVC developer command failed with exit code $LASTEXITCODE"
