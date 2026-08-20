@@ -1,0 +1,52 @@
+name: Release Trust PR Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# This workflow is intentionally validation-only. It never creates a release
+# ref, publishes provenance, or enters the owner-gated publication path.
+permissions:
+  contents: read
+
+jobs:
+  release-trust-dry-run:
+    name: Windows release trust dry run
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      COREGUARD_DRY_RUN_VERSION: 99.99.99
+      COREGUARD_DRY_RUN_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      COREGUARD_DRY_RUN_TIMESTAMP: ${{ github.run_started_at }}
+
+    steps:
+      - name: Checkout public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build, test, package, and verify synthetic release evidence
+        shell: pwsh
+        run: |
+          & python scripts/release_trust.py validate-version --version $env:COREGUARD_DRY_RUN_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & pwsh -NoProfile -File scripts/windows_release_trust.ps1 `
+            -Mode dry-run `
+            -Version $env:COREGUARD_DRY_RUN_VERSION `
+            -BuildDirectory build `
+            -ReleaseDirectory release `
+            -Commit $env:COREGUARD_DRY_RUN_COMMIT `
+            -Timestamp $env:COREGUARD_DRY_RUN_TIMESTAMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload dry-run evidence for CI inspection
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coreguard-release-trust-dry-run-${{ github.run_id }}
+          path: |
+            release/
+            build/CMakeCache.txt
+            build/CPackConfig.cmake
+          if-no-files-found: ignore
+          retention-days: 7

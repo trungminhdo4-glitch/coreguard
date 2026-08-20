@@ -142,6 +142,29 @@ guarantee.
   sandbox policy enforcement.
 - The archive is unsigned and no package-manager integration is provided.
 
+## Future release verification
+
+`v0.1.0` is a historical unsigned release and does not have a retroactive
+GitHub build-provenance attestation. Future tag releases will be built by the
+tag-only `.github/workflows/release.yml` workflow, which produces
+`SHA256SUMS` and `release-manifest.json` and attests the release ZIP only.
+
+For a future release, compare the ZIP with `SHA256SUMS`, compare the embedded
+`bin/coreguard.exe` with `coreguard_exe_sha256` in `release-manifest.json`, and
+run:
+
+```powershell
+gh attestation verify .\coreguard-X.Y.Z-windows-x64-msvc.zip `
+  --repo trungminhdo4-glitch/coreguard `
+  --signer-workflow trungminhdo4-glitch/coreguard/.github/workflows/release.yml `
+  --source-ref refs/tags/vX.Y.Z
+```
+
+The attestation links the digest to the repository, source tag/commit, and
+workflow. It is not a guarantee that the code is vulnerability-free. See
+[`docs/release-trust.md`](docs/release-trust.md) for the future release flow
+and deferred signing, SBOM, and package-manager decisions.
+
 ## License
 
 Coreguard is source-available, not open source, under the PolyForm Strict License 1.0.0.

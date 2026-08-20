@@ -1,0 +1,234 @@
+name: Published Release Artifact Compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - evidence/release-artifact-compat-v010
+
+permissions:
+  contents: read
+
+jobs:
+  published-artifact-compatibility:
+    name: ${{ matrix.lane }} published artifact consumer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: v143-windows-2022
+            runner: windows-2022
+            generator: Visual Studio 17 2022
+            expected_toolset_prefix: 14.4
+          - lane: v145-windows-2025-vs2026
+            runner: windows-2025-vs2026
+            generator: Visual Studio 18 2026
+            expected_toolset_prefix: 14.5
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      COREGUARD_RELEASE_URL: https://github.com/trungminhdo4-glitch/coreguard/releases/download/v0.1.0/coreguard-0.1.0-windows-x64-msvc.zip
+      COREGUARD_EXPECTED_SHA256: 795810a6f13ab7de9e83853f3b7d32b0c59a8e65d900e0e7701c13d2b381b63d
+      COREGUARD_GENERATOR: ${{ matrix.generator }}
+      COREGUARD_EXPECTED_TOOLSET_PREFIX: ${{ matrix.expected_toolset_prefix }}
+
+    steps:
+      - name: Download and isolate published release
+        shell: pwsh
+        run: |
+          $runRoot = Join-Path $env:RUNNER_TEMP "coreguard-compat-$env:COREGUARD_EXPECTED_TOOLSET_PREFIX"
+          $releaseRoot = Join-Path $runRoot "downloaded-release"
+          $zipPath = Join-Path $runRoot "coreguard-0.1.0-windows-x64-msvc.zip"
+
+          New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+          Invoke-WebRequest -Uri $env:COREGUARD_RELEASE_URL -OutFile $zipPath -UseBasicParsing
+
+          $actualSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "Release asset: $env:COREGUARD_RELEASE_URL"
+          Write-Output "Expected SHA-256: $env:COREGUARD_EXPECTED_SHA256"
+          Write-Output "Actual SHA-256:   $actualSha256"
+          if ($actualSha256 -ne $env:COREGUARD_EXPECTED_SHA256) {
+            Write-Output "RELEASE_ARTIFACT_INTEGRITY_FAILURE"
+            exit 1
+          }
+
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $releaseRoot -Force
+
+          $forbiddenCheckoutPaths = @("include", "src", "build", "CMakeLists.txt")
+          foreach ($relativePath in $forbiddenCheckoutPaths) {
+            $candidate = Join-Path $env:GITHUB_WORKSPACE $relativePath
+            if (Test-Path -LiteralPath $candidate) {
+              throw "Source checkout isolation failure: $candidate"
+            }
+          }
+          $checkoutCoreguardFiles = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @("coreguard.h", "coreguard.lib", "coreguard.exe") })
+          if ($checkoutCoreguardFiles.Count -ne 0) {
+            throw "Coreguard files found in the checkout workspace: $($checkoutCoreguardFiles.FullName -join ', ')"
+          }
+
+          $cliCandidates = @(Get-ChildItem -LiteralPath $releaseRoot -Filter "coreguard.exe" -File -Recurse)
+          $libraryCandidates = @(Get-ChildItem -LiteralPath $releaseRoot -Filter "coreguard.lib" -File -Recurse)
+          $configCandidates = @(Get-ChildItem -LiteralPath $releaseRoot -Filter "coreguardConfig.cmake" -File -Recurse)
+          if ($cliCandidates.Count -ne 1 -or $libraryCandidates.Count -ne 1 -or $configCandidates.Count -ne 1) {
+            throw "Unexpected release layout: cli=$($cliCandidates.Count), lib=$($libraryCandidates.Count), config=$($configCandidates.Count)"
+          }
+
+          $cConsumerRoot = Join-Path $runRoot "c-consumer"
+          $cppConsumerRoot = Join-Path $runRoot "cpp-consumer"
+          New-Item -ItemType Directory -Path $cConsumerRoot, $cppConsumerRoot -Force | Out-Null
+
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(coreguard_c_consumer C)
+
+          find_package(coreguard 0.1.0 EXACT CONFIG REQUIRED)
+
+          add_executable(coreguard_consumer main.c)
+          target_link_libraries(
+              coreguard_consumer
+              PRIVATE
+              coreguard::coreguard
+          )
+          '@ | Set-Content -LiteralPath (Join-Path $cConsumerRoot "CMakeLists.txt") -Encoding utf8
+
+          @'
+          #include <coreguard.h>
+
+          int main(void)
+          {
+              const wchar_t *child_argv[] = {L"cmd.exe", L"/C", L"exit", L"0"};
+              cg_run_options options = {child_argv, 4U, 5000U, 0, NULL};
+              cg_run_result result = {0};
+              int rc = cg_run(&options, &result);
+              int ok = rc == 0 && result.status == CG_STATUS_EXITED &&
+                       result.has_exit_code && result.exit_code == 0U &&
+                       result.cleanup_ok;
+
+              cg_run_result_free(&result);
+              return ok ? 0 : 1;
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $cConsumerRoot "main.c") -Encoding utf8
+
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(coreguard_cpp_consumer LANGUAGES CXX)
+
+          find_package(coreguard 0.1.0 EXACT CONFIG REQUIRED)
+
+          add_executable(coreguard_cpp_consumer main.cpp)
+          target_link_libraries(
+              coreguard_cpp_consumer
+              PRIVATE
+              coreguard::coreguard
+          )
+          '@ | Set-Content -LiteralPath (Join-Path $cppConsumerRoot "CMakeLists.txt") -Encoding utf8
+
+          @'
+          #include <coreguard.h>
+
+          int main()
+          {
+              const wchar_t *child_argv[] = {L"cmd.exe", L"/C", L"exit", L"0"};
+              cg_run_options options = {child_argv, 4U, 5000U, 0, nullptr};
+              cg_run_result result{};
+              int rc = cg_run(&options, &result);
+              bool ok = rc == 0 && result.status == CG_STATUS_EXITED &&
+                        result.has_exit_code && result.exit_code == 0U &&
+                        result.cleanup_ok;
+
+              cg_run_result_free(&result);
+              return ok ? 0 : 1;
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $cppConsumerRoot "main.cpp") -Encoding utf8
+
+          Write-Output "GITHUB_WORKSPACE=$env:GITHUB_WORKSPACE"
+          Write-Output "Checkout step: not used"
+          Write-Output "RUN_ROOT=$runRoot"
+          Write-Output "RELEASE_ROOT=$releaseRoot"
+          Write-Output "Downloaded release contents:"
+          Get-ChildItem -LiteralPath $releaseRoot -File -Recurse | Select-Object -ExpandProperty FullName
+
+          "COREGUARD_RUN_ROOT=$runRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "COREGUARD_RELEASE_ROOT=$releaseRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "COREGUARD_EXE=$($cliCandidates[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "COREGUARD_C_CONSUMER_ROOT=$cConsumerRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "COREGUARD_CPP_CONSUMER_ROOT=$cppConsumerRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Identify toolchain, consume artifact, and run proofs
+        shell: cmd
+        run: |
+          @echo on
+          echo ==== WINDOWS IDENTITY ====
+          ver
+          powershell -NoProfile -Command "$os = Get-CimInstance Win32_OperatingSystem; Write-Output ($os.Caption + ' ' + $os.Version)"
+
+          echo ==== MSVC ACTIVATION ====
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (echo MSVC x64 installation not found& exit /b 1)
+          echo VSINSTALL=%VSINSTALL%
+          if not exist "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" (echo vcvars64.bat not found& exit /b 1)
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+
+          echo ==== TOOLCHAIN IDENTITY ====
+          echo Toolset expectation: %COREGUARD_EXPECTED_TOOLSET_PREFIX%
+          echo VCToolsVersion=%VCToolsVersion%
+          if /I not "%VCToolsVersion:~0,4%"=="%COREGUARD_EXPECTED_TOOLSET_PREFIX%" (echo Unexpected MSVC toolset& exit /b 1)
+          where cl
+          cl
+          where link
+          link
+          cmake --version
+          echo Generator=%COREGUARD_GENERATOR%
+          echo Architecture=x64
+
+          echo ==== CLI PROOF: EXIT 0 ====
+          "%COREGUARD_EXE%" run -- cmd.exe /C exit 0
+          if errorlevel 1 (echo CLI_EXIT_0_PROOF_FAILED& exit /b 1)
+
+          echo ==== CLI PROOF: NONZERO 7 ====
+          "%COREGUARD_EXE%" run -- cmd.exe /C exit 7
+          if not errorlevel 7 (echo CLI_NONZERO_PROOF_FAILED& exit /b 1)
+          if errorlevel 8 (echo CLI_NONZERO_PROOF_FAILED& exit /b 1)
+
+          echo ==== CLI PROOF: TIMEOUT ====
+          "%COREGUARD_EXE%" run --timeout-ms 250 -- cmd.exe /C "ping 127.0.0.1 -n 6 >NUL" > "%COREGUARD_RUN_ROOT%\cli-timeout.log" 2>&1
+          set "CLI_TIMEOUT_RC=%ERRORLEVEL%"
+          type "%COREGUARD_RUN_ROOT%\cli-timeout.log"
+          if not "%CLI_TIMEOUT_RC%"=="124" (echo CLI_TIMEOUT_EXIT_PROOF_FAILED& exit /b 1)
+          findstr /I /C:"status=timeout" "%COREGUARD_RUN_ROOT%\cli-timeout.log" >NUL
+          if errorlevel 1 (echo CLI_TIMEOUT_STATUS_PROOF_FAILED& exit /b 1)
+          findstr /I /C:"cleanup_ok=true" "%COREGUARD_RUN_ROOT%\cli-timeout.log" >NUL
+          if errorlevel 1 (echo CLI_TIMEOUT_CLEANUP_PROOF_FAILED& exit /b 1)
+
+          echo ==== C CONSUMER: CONFIGURE / LINK / EXECUTE ====
+          cmake -S "%COREGUARD_C_CONSUMER_ROOT%" -B "%COREGUARD_RUN_ROOT%\c-build" -G "%COREGUARD_GENERATOR%" -A x64 -Dcoreguard_DIR="%COREGUARD_RELEASE_ROOT%\lib\cmake\coreguard"
+          if errorlevel 1 exit /b 1
+          cmake --build "%COREGUARD_RUN_ROOT%\c-build" --config Release --parallel 2 --verbose > "%COREGUARD_RUN_ROOT%\c-build.log" 2>&1
+          set "C_BUILD_RC=%ERRORLEVEL%"
+          type "%COREGUARD_RUN_ROOT%\c-build.log"
+          if not "%C_BUILD_RC%"=="0" exit /b %C_BUILD_RC%
+          "%COREGUARD_RUN_ROOT%\c-build\Release\coreguard_consumer.exe"
+          if errorlevel 1 (echo C_CONSUMER_EXECUTION_FAILED& exit /b 1)
+
+          echo ==== C++ CONSUMER: CONFIGURE / LINK / EXECUTE ====
+          cmake -S "%COREGUARD_CPP_CONSUMER_ROOT%" -B "%COREGUARD_RUN_ROOT%\cpp-build" -G "%COREGUARD_GENERATOR%" -A x64 -Dcoreguard_DIR="%COREGUARD_RELEASE_ROOT%\lib\cmake\coreguard"
+          if errorlevel 1 exit /b 1
+          cmake --build "%COREGUARD_RUN_ROOT%\cpp-build" --config Release --parallel 2 --verbose > "%COREGUARD_RUN_ROOT%\cpp-build.log" 2>&1
+          set "CPP_BUILD_RC=%ERRORLEVEL%"
+          type "%COREGUARD_RUN_ROOT%\cpp-build.log"
+          if not "%CPP_BUILD_RC%"=="0" exit /b %CPP_BUILD_RC%
+          "%COREGUARD_RUN_ROOT%\cpp-build\Release\coreguard_cpp_consumer.exe"
+          if errorlevel 1 (echo CPP_CONSUMER_EXECUTION_FAILED& exit /b 1)
+
+          echo ==== PUBLISHED ARTIFACT COMPATIBILITY LANE PASSED ====
+
+      - name: Upload lane failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coreguard-artifact-compat-${{ matrix.lane }}-logs
+          path: ${{ runner.temp }}/coreguard-compat-*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
