@@ -94,7 +94,7 @@ $developerCommand = @(
     ('cmake --build "' + $buildPath + '" --config Release --parallel --verbose'),
     'python -m unittest discover -s tests -p "test_*.py" -v',
     ('python tests\verification.py --exe "' + $executablePath + '"'),
-    ('cpack --config "' + (Join-Path $buildPath "CPackConfig.cmake") + '" -C Release')
+    ('cd /d "' + $buildPath + '" && cpack --config "' + (Join-Path $buildPath "CPackConfig.cmake") + '" -C Release')
 ) -join " && "
 
 Write-Host "Coreguard release trust mode: $Mode"
