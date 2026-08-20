@@ -139,6 +139,8 @@ def validate_package(archive_path: pathlib.Path, version: str | None = None) -> 
         with zipfile.ZipFile(archive_path) as archive:
             names: list[str] = []
             for info in archive.infolist():
+                if info.is_dir():
+                    continue
                 name = _zip_member_name(info)
                 if name in names:
                     raise ReleaseTrustError(f"duplicate ZIP member: {name}")

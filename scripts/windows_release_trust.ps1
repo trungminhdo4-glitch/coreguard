@@ -54,10 +54,10 @@ $vsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer
 if (-not (Test-Path -LiteralPath $vsWhere)) {
     throw "vswhere.exe was not found: $vsWhere"
 }
-$LASTEXITCODE = 0
+$global:LASTEXITCODE = 0
 $vsInstall = (& $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
     Select-Object -First 1)
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstall)) {
+if ($global:LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstall)) {
     throw "MSVC x64 installation was not found"
 }
 $vsInstall = $vsInstall.Trim()
@@ -70,10 +70,10 @@ function Invoke-DeveloperCommand {
     param([Parameter(Mandatory = $true)][string]$CommandLine)
 
     Write-Host "Executing MSVC developer command: $CommandLine"
-    $LASTEXITCODE = 0
+    $global:LASTEXITCODE = 0
     & $env:ComSpec /d /s /c $CommandLine
-    if ($LASTEXITCODE -ne 0) {
-        throw "MSVC developer command failed with exit code $LASTEXITCODE"
+    if ($global:LASTEXITCODE -ne 0) {
+        throw "MSVC developer command failed with exit code $global:LASTEXITCODE"
     }
 }
 
@@ -81,10 +81,10 @@ function Invoke-PythonGate {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
     Write-Host ("Executing release trust gate: python " + ($Arguments -join " "))
-    $LASTEXITCODE = 0
+    $global:LASTEXITCODE = 0
     & python $trustScript @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Release trust gate failed with exit code $LASTEXITCODE"
+    if ($global:LASTEXITCODE -ne 0) {
+        throw "Release trust gate failed with exit code $global:LASTEXITCODE"
     }
 }
 

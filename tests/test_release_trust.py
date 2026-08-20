@@ -32,8 +32,17 @@ TAG = "v1.2.3"
 COMMIT = "a" * 40
 
 
-def make_archive(path: pathlib.Path, *, version: str = VERSION, extra: str | None = None) -> None:
+def make_archive(
+    path: pathlib.Path,
+    *,
+    version: str = VERSION,
+    extra: str | None = None,
+    include_directories: bool = False,
+) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if include_directories:
+            for directory in ("bin/", "include/", "lib/", "lib/cmake/", "lib/cmake/coreguard/"):
+                archive.writestr(directory, b"")
         for name in sorted(EXPECTED_PACKAGE_FILES):
             content = f"fixture:{name}".encode("utf-8")
             if name.endswith("coreguardConfigVersion.cmake"):
@@ -68,6 +77,13 @@ class ReleaseTrustTests(unittest.TestCase):
                 summary.coreguard_exe_sha256,
                 hashlib.sha256(b"fixture:bin/coreguard.exe").hexdigest(),
             )
+
+    def test_cpack_directory_members_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            archive = pathlib.Path(temp) / expected_archive_name(VERSION)
+            make_archive(archive, include_directories=True)
+            summary = validate_package(archive, VERSION)
+            self.assertEqual(set(summary.entries), EXPECTED_PACKAGE_FILES)
 
     def test_unexpected_package_content_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
