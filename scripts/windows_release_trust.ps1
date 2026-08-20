@@ -79,6 +79,7 @@ function Invoke-PythonGate {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
     Write-Host ("Executing release trust gate: python " + ($Arguments -join " "))
+    $LASTEXITCODE = 0
     & python $trustScript @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Release trust gate failed with exit code $LASTEXITCODE"

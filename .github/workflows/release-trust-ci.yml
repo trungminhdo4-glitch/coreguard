@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 30
     env:
       COREGUARD_DRY_RUN_VERSION: 99.99.99
-      COREGUARD_DRY_RUN_COMMIT: ${{ github.sha }}
+      COREGUARD_DRY_RUN_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
       COREGUARD_DRY_RUN_TIMESTAMP: ${{ github.run_started_at }}
 
     steps:
