@@ -26,6 +26,57 @@ attested as a misleading standalone release artifact.
 The workflow is `.github/workflows/release.yml`. It has no pull-request trigger,
 does not create tags, and a tag push does not publish a GitHub Release.
 
+## Pre-merge Windows validation
+
+`.github/workflows/release-trust-ci.yml` is the unprivileged pre-merge path. It
+runs on `windows-latest` with only `contents: read` and uses the same
+`scripts/windows_release_trust.ps1` and `scripts/release_trust.py` primitives
+as the future release workflow. The hosted runner performs MSVC activation,
+CMake configure, Release build, the existing tests and `verification.py`,
+CPack ZIP creation, package/version gates, `SHA256SUMS` generation and
+verification, `release-manifest.json` generation and verification, and uploads
+the evidence for CI inspection.
+
+The validation version is the synthetic `99.99.99`. It is passed directly to
+CMake; no repository ref is created. The generated manifest records
+`release_mode: dry-run-validation`, has no Git tag, and records that neither
+attestation nor publication was attempted. The PR workflow has no attestation,
+OIDC, write-content, release-publication, release, or tag-creation capability.
+
+All external Actions in the release/trust workflows are pinned to full commit
+SHAs with a readable release comment. The static workflow test rejects branch,
+major-only, and release-tag references in future edits.
+
+## Workflow dispatch evidence order
+
+GitHub only exposes a newly introduced `workflow_dispatch` workflow after that
+workflow file exists on the repository's default branch. A feature-branch
+checkout therefore cannot provide normal manual-dispatch end-to-end evidence
+for this new workflow. The intended evidence order is:
+
+1. Pre-merge PR validation on the hosted Windows runner.
+2. Owner-gated push and Draft PR review.
+3. Merge to the default branch.
+4. Post-merge manual dispatch of `release.yml` with `publish=false`.
+
+The `release-publication` environment is used only by the separate publication
+job after a successful build, package validation, checksum/manifest evidence,
+and attestation. Its reviewer/protection configuration is an owner-controlled
+post-merge step and is not mutated by this validation change.
+
+## Effective release workflow permissions
+
+| Job | Effective permissions | Boundary |
+| --- | --- | --- |
+| `build-package` | `contents: read` | MSVC build, tests, CPack, package and manifest gates |
+| `attest` | `contents: read`, `id-token: write`, `attestations: write` | Attests only the verified ZIP and evidence files |
+| `publish` | `contents: write` | Manual `workflow_dispatch`, `publish=true`, protected environment |
+
+The workflow-level default is empty. Build/package and attestation jobs have no
+content-write permission, and the PR-validation workflow has no write or
+attestation permission at all. No environment mutation or environment secret
+is part of this wave; the attestation uses GitHub's OIDC/GitHub-token boundary.
+
 ## Consumer verification
 
 After downloading a future release ZIP and the two evidence files:

@@ -18,9 +18,11 @@ from release_trust import (  # noqa: E402
     ReleaseTrustError,
     expected_archive_name,
     release_version_from_tag,
+    validate_version,
     validate_configured_build,
     validate_package,
     verify_sha256sums,
+    verify_release_manifest,
     write_release_evidence,
 )
 
@@ -42,6 +44,11 @@ def make_archive(path: pathlib.Path, *, version: str = VERSION, extra: str | Non
 
 
 class ReleaseTrustTests(unittest.TestCase):
+    def test_synthetic_future_version_contract(self) -> None:
+        self.assertEqual(validate_version("99.99.99"), "99.99.99")
+        with self.assertRaisesRegex(ReleaseTrustError, "version"):
+            validate_version("99.99")
+
     def test_tag_contract(self) -> None:
         self.assertEqual(release_version_from_tag(TAG), VERSION)
         with self.assertRaises(ReleaseTrustError):
@@ -118,6 +125,16 @@ class ReleaseTrustTests(unittest.TestCase):
                 timestamp="2026-08-20T10:00:00Z",
             )
             self.assertEqual(verify_sha256sums(output_a / "SHA256SUMS", archive), result["zip_sha256"])
+            self.assertEqual(
+                verify_release_manifest(
+                    output_a / "release-manifest.json",
+                    output_a / "SHA256SUMS",
+                    archive,
+                    version=VERSION,
+                    commit_sha=COMMIT,
+                )["status"],
+                "PASS",
+            )
 
             tampered = root / "tampered" / archive.name
             tampered.parent.mkdir()
@@ -157,12 +174,45 @@ class ReleaseTrustTests(unittest.TestCase):
             self.assertEqual(manifest["coreguard_exe_sha256"], first["coreguard_exe_sha256"])
             self.assertEqual(first["zip_sha256"], second["zip_sha256"])
 
+    def test_dry_run_evidence_has_no_tag_or_attestation_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            version = "99.99.99"
+            archive = root / expected_archive_name(version)
+            make_archive(archive, version=version)
+            output = root / "dry-run"
+            write_release_evidence(
+                archive_path=archive,
+                version=version,
+                commit_sha=COMMIT,
+                output_dir=output,
+                timestamp="2026-08-20T10:00:00Z",
+                dry_run=True,
+            )
+            manifest = json.loads((output / "release-manifest.json").read_text())
+            self.assertIsNone(manifest["git_tag"])
+            self.assertEqual(manifest["release_mode"], "dry-run-validation")
+            self.assertEqual(manifest["provenance"]["attestation"], "not generated")
+            self.assertEqual(
+                verify_release_manifest(
+                    output / "release-manifest.json",
+                    output / "SHA256SUMS",
+                    archive,
+                    version=version,
+                    commit_sha=COMMIT,
+                    dry_run=True,
+                )["status"],
+                "PASS",
+            )
+
     def test_workflow_is_tag_only_and_owner_gated_for_publication(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("pull_request:", workflow)
-        self.assertIn("actions/attest@v4.2.1", workflow)
+        self.assertIn(
+            "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d", workflow
+        )
         self.assertIn("id-token: write", workflow)
         self.assertIn("attestations: write", workflow)
         self.assertIn("contents: read", workflow)

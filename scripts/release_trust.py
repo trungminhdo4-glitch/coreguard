@@ -21,6 +21,7 @@ from dataclasses import dataclass
 REPOSITORY = "trungminhdo4-glitch/coreguard"
 WORKFLOW_PATH = ".github/workflows/release.yml"
 TAG_PATTERN = re.compile(r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$")
+VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -72,7 +73,17 @@ def release_version_from_tag(tag: str) -> str:
         raise ReleaseTrustError(
             f"release ref must match vX.Y.Z exactly, received {tag!r}"
         )
-    return match.group("version")
+    return validate_version(match.group("version"))
+
+
+def validate_version(version: str) -> str:
+    """Validate a numeric semantic version without asserting a Git tag exists."""
+
+    if not VERSION_PATTERN.fullmatch(version):
+        raise ReleaseTrustError(
+            f"version must match X.Y.Z exactly, received {version!r}"
+        )
+    return version
 
 
 def expected_archive_name(version: str) -> str:
@@ -189,7 +200,7 @@ def validate_configured_build(
 ) -> dict[str, str]:
     """Check CMake/CPack outputs before a release archive is attested."""
 
-    release_version_from_tag(f"v{version}")
+    validate_version(version)
     build_dir = build_dir.resolve()
     cache_text = _read_text(build_dir / "CMakeCache.txt")
     configured_version = _cmake_cache_value(cache_text, "COREGUARD_VERSION")
@@ -246,16 +257,35 @@ def _default_timestamp() -> str:
 def write_release_evidence(
     *,
     archive_path: pathlib.Path,
-    tag: str,
+    tag: str | None = None,
+    version: str | None = None,
     commit_sha: str,
     output_dir: pathlib.Path,
     timestamp: str | None = None,
     repository: str = REPOSITORY,
     workflow_path: str = WORKFLOW_PATH,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     """Write deterministic-for-fixed-input release evidence files."""
 
-    version = release_version_from_tag(tag)
+    if dry_run:
+        if tag is not None:
+            raise ReleaseTrustError("dry-run evidence cannot carry a Git tag")
+        if version is None:
+            raise ReleaseTrustError("dry-run evidence requires a synthetic version")
+        version = validate_version(version)
+        git_tag: str | None = None
+    else:
+        if tag is None:
+            raise ReleaseTrustError("release evidence requires a Git tag")
+        tagged_version = release_version_from_tag(tag)
+        if version is not None and validate_version(version) != tagged_version:
+            raise ReleaseTrustError(
+                f"evidence version mismatch: tag carries {tagged_version}, received {version}"
+            )
+        version = tagged_version
+        git_tag = tag
+
     if not COMMIT_PATTERN.fullmatch(commit_sha):
         raise ReleaseTrustError("commit SHA must be a full 40-character hexadecimal SHA")
     summary = validate_package(archive_path, version)
@@ -267,16 +297,22 @@ def write_release_evidence(
     sha_path.write_text(
         f"{summary.archive_sha256}  {summary.archive_name}\n", encoding="utf-8"
     )
+    release_mode = "dry-run-validation" if dry_run else "release"
     verification_command = (
-        f"gh attestation verify {summary.archive_name} --repo {repository} "
-        f"--signer-workflow {repository}/{workflow_path} "
-        f"--source-ref refs/tags/{tag}"
+        "not generated in PR-safe validation"
+        if dry_run
+        else (
+            f"gh attestation verify {summary.archive_name} --repo {repository} "
+            f"--signer-workflow {repository}/{workflow_path} "
+            f"--source-ref refs/tags/{tag}"
+        )
     )
     manifest: dict[str, object] = {
         "manifest_schema_version": 1,
         "project": "coreguard",
         "version": version,
-        "git_tag": tag,
+        "git_tag": git_tag,
+        "release_mode": release_mode,
         "commit_sha": commit_sha.lower(),
         "build_platform": "Windows",
         "architecture": "x64",
@@ -293,7 +329,9 @@ def write_release_evidence(
             "workflow": workflow_path,
             "predicate_type": "https://slsa.dev/provenance/v1",
             "verification_command": verification_command,
+            "attestation": "not generated" if dry_run else "github-artifact-attestation",
         },
+        "publication": "not attempted" if dry_run else "owner-gated workflow step",
         "historical_v0_1_0_attestation": "not asserted by this workflow",
     }
     manifest_path.write_text(
@@ -335,6 +373,64 @@ def verify_sha256sums(checksums_path: pathlib.Path, artifact_path: pathlib.Path)
     return actual_digest
 
 
+def verify_release_manifest(
+    manifest_path: pathlib.Path,
+    checksums_path: pathlib.Path,
+    artifact_path: pathlib.Path,
+    *,
+    version: str,
+    commit_sha: str,
+    dry_run: bool = False,
+) -> dict[str, str]:
+    """Verify manifest, package inventory, and checksum evidence as one gate."""
+
+    version = validate_version(version)
+    if not COMMIT_PATTERN.fullmatch(commit_sha):
+        raise ReleaseTrustError("commit SHA must be a full 40-character hexadecimal SHA")
+    summary = validate_package(artifact_path, version)
+    verified_sha = verify_sha256sums(checksums_path, artifact_path)
+    try:
+        manifest = json.loads(_read_text(manifest_path))
+    except json.JSONDecodeError as exc:
+        raise ReleaseTrustError(f"release manifest is not valid JSON: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ReleaseTrustError("release manifest must contain a JSON object")
+
+    expected_tag = None if dry_run else f"v{version}"
+    expected_mode = "dry-run-validation" if dry_run else "release"
+    checks = {
+        "manifest_schema_version": 1,
+        "project": "coreguard",
+        "version": version,
+        "git_tag": expected_tag,
+        "release_mode": expected_mode,
+        "commit_sha": commit_sha.lower(),
+        "artifact_filename": summary.archive_name,
+        "zip_sha256": verified_sha,
+        "coreguard_exe_sha256": summary.coreguard_exe_sha256,
+        "artifact_entries": list(summary.entries),
+        "historical_v0_1_0_attestation": "not asserted by this workflow",
+    }
+    for key, expected in checks.items():
+        if manifest.get(key) != expected:
+            raise ReleaseTrustError(
+                f"release manifest mismatch for {key}: expected {expected!r}, "
+                f"received {manifest.get(key)!r}"
+            )
+
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ReleaseTrustError("release manifest provenance is missing")
+    expected_attestation = "not generated" if dry_run else "github-artifact-attestation"
+    if provenance.get("attestation") != expected_attestation:
+        raise ReleaseTrustError(
+            "release manifest attestation state does not match the workflow mode"
+        )
+    if dry_run and manifest.get("publication") != "not attempted":
+        raise ReleaseTrustError("dry-run manifest must state that publication was not attempted")
+    return {"status": "PASS", "mode": expected_mode, "version": version}
+
+
 def _summary(summary: PackageSummary) -> dict[str, object]:
     return {
         "status": "PASS",
@@ -352,8 +448,13 @@ def main(argv: list[str] | None = None) -> int:
     tag_parser = subparsers.add_parser("validate-tag")
     tag_parser.add_argument("--tag", required=True)
 
+    version_parser = subparsers.add_parser("validate-version")
+    version_parser.add_argument("--version", required=True)
+
     build_parser = subparsers.add_parser("validate-build")
-    build_parser.add_argument("--tag", required=True)
+    build_version = build_parser.add_mutually_exclusive_group(required=True)
+    build_version.add_argument("--tag")
+    build_version.add_argument("--version")
     build_parser.add_argument("--build-dir", type=pathlib.Path, required=True)
     build_parser.add_argument("--artifact", type=pathlib.Path, required=True)
 
@@ -363,42 +464,71 @@ def main(argv: list[str] | None = None) -> int:
 
     evidence_parser = subparsers.add_parser("write-evidence")
     evidence_parser.add_argument("--artifact", type=pathlib.Path, required=True)
-    evidence_parser.add_argument("--tag", required=True)
+    evidence_version = evidence_parser.add_mutually_exclusive_group(required=True)
+    evidence_version.add_argument("--tag")
+    evidence_version.add_argument("--version")
     evidence_parser.add_argument("--commit", required=True)
     evidence_parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     evidence_parser.add_argument("--timestamp")
     evidence_parser.add_argument("--repository", default=REPOSITORY)
     evidence_parser.add_argument("--workflow", default=WORKFLOW_PATH)
+    evidence_parser.add_argument("--dry-run", action="store_true")
 
     sums_parser = subparsers.add_parser("verify-sha256sums")
     sums_parser.add_argument("--checksums", type=pathlib.Path, required=True)
     sums_parser.add_argument("--artifact", type=pathlib.Path, required=True)
 
+    manifest_parser = subparsers.add_parser("verify-manifest")
+    manifest_parser.add_argument("--manifest", type=pathlib.Path, required=True)
+    manifest_parser.add_argument("--checksums", type=pathlib.Path, required=True)
+    manifest_parser.add_argument("--artifact", type=pathlib.Path, required=True)
+    manifest_parser.add_argument("--version", required=True)
+    manifest_parser.add_argument("--commit", required=True)
+    manifest_parser.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "validate-tag":
             print(json.dumps({"status": "PASS", "version": release_version_from_tag(args.tag)}))
+        elif args.command == "validate-version":
+            print(json.dumps({"status": "PASS", "version": validate_version(args.version)}))
         elif args.command == "validate-build":
-            version = release_version_from_tag(args.tag)
+            version = (
+                release_version_from_tag(args.tag)
+                if args.tag is not None
+                else validate_version(args.version)
+            )
             result = validate_configured_build(args.build_dir, version, args.artifact)
             print(json.dumps({"status": "PASS", **result}, sort_keys=True))
         elif args.command == "validate-package":
-            version = release_version_from_tag(f"v{args.version}") if args.version else None
+            version = validate_version(args.version) if args.version else None
             print(json.dumps(_summary(validate_package(args.artifact, version)), sort_keys=True))
         elif args.command == "write-evidence":
             result = write_release_evidence(
                 archive_path=args.artifact,
                 tag=args.tag,
+                version=args.version,
                 commit_sha=args.commit,
                 output_dir=args.output_dir,
                 timestamp=args.timestamp,
                 repository=args.repository,
                 workflow_path=args.workflow,
+                dry_run=args.dry_run,
             )
             print(json.dumps({"status": "PASS", **result}, sort_keys=True))
         elif args.command == "verify-sha256sums":
             digest = verify_sha256sums(args.checksums, args.artifact)
             print(json.dumps({"status": "PASS", "sha256": digest}))
+        elif args.command == "verify-manifest":
+            result = verify_release_manifest(
+                args.manifest,
+                args.checksums,
+                args.artifact,
+                version=args.version,
+                commit_sha=args.commit,
+                dry_run=args.dry_run,
+            )
+            print(json.dumps(result, sort_keys=True))
         else:  # pragma: no cover - argparse enforces this
             raise ReleaseTrustError(f"unknown command: {args.command}")
     except ReleaseTrustError as exc:
