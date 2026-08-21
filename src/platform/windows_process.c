@@ -683,7 +683,10 @@ static int cg_capture_create(cg_capture_file *capture)
     }
     ZeroMemory(&attributes, sizeof(attributes));
     attributes.nLength = sizeof(attributes);
-    attributes.bInheritHandle = TRUE;
+    /* The capture handle is retained by the parent for the readback.  It is
+       not itself a child handle; the spawn path creates an explicit,
+       child-only inheritable duplicate below. */
+    attributes.bInheritHandle = FALSE;
     capture->handle = CreateFileW(
         capture->path,
         GENERIC_READ | GENERIC_WRITE,
@@ -693,14 +696,6 @@ static int cg_capture_create(cg_capture_file *capture)
         FILE_ATTRIBUTE_TEMPORARY,
         NULL);
     if (capture->handle == INVALID_HANDLE_VALUE) {
-        DeleteFileW(capture->path);
-        capture->path[0] = L'\0';
-        return 0;
-    }
-    if (!SetHandleInformation(capture->handle, HANDLE_FLAG_INHERIT,
-                              HANDLE_FLAG_INHERIT)) {
-        CloseHandle(capture->handle);
-        capture->handle = INVALID_HANDLE_VALUE;
         DeleteFileW(capture->path);
         capture->path[0] = L'\0';
         return 0;
@@ -857,6 +852,33 @@ static int cg_terminate_job(HANDLE job, HANDLE process, cg_run_result *result,
     return 1;
 }
 
+static int cg_duplicate_child_handle(HANDLE source, HANDLE *child_handle_out,
+                                     DWORD *error_out)
+{
+    HANDLE duplicate;
+
+    *child_handle_out = source;
+    if (source == NULL || source == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+    duplicate = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(),
+                         &duplicate, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        *error_out = GetLastError();
+        return 0;
+    }
+    *child_handle_out = duplicate;
+    return 1;
+}
+
+static void cg_close_child_handle(HANDLE source, HANDLE child_handle)
+{
+    if (child_handle != NULL && child_handle != INVALID_HANDLE_VALUE &&
+        child_handle != source) {
+        CloseHandle(child_handle);
+    }
+}
+
 static int cg_windows_run_internal(
     const cg_run_options *options,
     cg_run_result *result,
@@ -868,7 +890,7 @@ static int cg_windows_run_internal(
     HANDLE process = NULL;
     HANDLE thread = NULL;
     PROCESS_INFORMATION process_info;
-    STARTUPINFOW startup_info;
+    STARTUPINFOEXW startup_info;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     cg_wbuilder command_line;
     cg_capture_file stdout_capture;
@@ -876,6 +898,14 @@ static int cg_windows_run_internal(
     HANDLE stdin_handle;
     HANDLE stdout_handle;
     HANDLE stderr_handle;
+    HANDLE child_stdin_handle;
+    HANDLE child_stdout_handle;
+    HANDLE child_stderr_handle;
+    HANDLE inherited_handles[3];
+    SIZE_T inherited_handle_count;
+    SIZE_T attribute_list_size;
+    LPPROC_THREAD_ATTRIBUTE_LIST attribute_list;
+    int attribute_list_initialized;
     DWORD wait_result;
     DWORD exit_code = 0;
     DWORD last_error = ERROR_SUCCESS;
@@ -898,6 +928,16 @@ static int cg_windows_run_internal(
     command_line.data = NULL;
     command_line.length = 0;
     command_line.capacity = 0;
+    child_stdin_handle = NULL;
+    child_stdout_handle = NULL;
+    child_stderr_handle = NULL;
+    stdin_handle = NULL;
+    stdout_handle = NULL;
+    stderr_handle = NULL;
+    inherited_handle_count = 0;
+    attribute_list_size = 0;
+    attribute_list = NULL;
+    attribute_list_initialized = 0;
     cg_capture_init(&stdout_capture);
     cg_capture_init(&stderr_capture);
     result->status = CG_STATUS_INTERNAL_ERROR;
@@ -976,15 +1016,78 @@ static int cg_windows_run_internal(
                                             : GetStdHandle(STD_OUTPUT_HANDLE);
     stderr_handle = options->capture_output ? stderr_capture.handle
                                             : GetStdHandle(STD_ERROR_HANDLE);
-    startup_info.cb = sizeof(startup_info);
-    startup_info.dwFlags = STARTF_USESTDHANDLES;
-    startup_info.hStdInput = stdin_handle;
-    startup_info.hStdOutput = stdout_handle;
-    startup_info.hStdError = stderr_handle;
+    if (!cg_duplicate_child_handle(stdin_handle, &child_stdin_handle,
+                                   &last_error) ||
+        !cg_duplicate_child_handle(stdout_handle, &child_stdout_handle,
+                                   &last_error) ||
+        !cg_duplicate_child_handle(stderr_handle, &child_stderr_handle,
+                                   &last_error)) {
+        cg_set_error(result, last_error);
+        result->status = CG_STATUS_START_FAILED;
+        goto cleanup;
+    }
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = child_stdin_handle;
+    startup_info.StartupInfo.hStdOutput = child_stdout_handle;
+    startup_info.StartupInfo.hStdError = child_stderr_handle;
+    if (child_stdin_handle != NULL &&
+        child_stdin_handle != INVALID_HANDLE_VALUE) {
+        inherited_handles[inherited_handle_count++] = child_stdin_handle;
+    }
+    if (child_stdout_handle != NULL &&
+        child_stdout_handle != INVALID_HANDLE_VALUE) {
+        inherited_handles[inherited_handle_count++] = child_stdout_handle;
+    }
+    if (child_stderr_handle != NULL &&
+        child_stderr_handle != INVALID_HANDLE_VALUE) {
+        inherited_handles[inherited_handle_count++] = child_stderr_handle;
+    }
 
-    if (!CreateProcessW(NULL, command_line.data, NULL, NULL, TRUE,
-                        CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-                        NULL, NULL, &startup_info, &process_info)) {
+    if (inherited_handle_count > 0) {
+        attribute_list = NULL;
+        if (InitializeProcThreadAttributeList(NULL, 1, 0,
+                                               &attribute_list_size) ||
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER ||
+            attribute_list_size == 0) {
+            cg_set_error(result, GetLastError());
+            result->status = CG_STATUS_START_FAILED;
+            goto cleanup;
+        }
+        attribute_list = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+            GetProcessHeap(), 0, attribute_list_size);
+        if (attribute_list == NULL) {
+            cg_set_error(result, ERROR_NOT_ENOUGH_MEMORY);
+            result->status = CG_STATUS_START_FAILED;
+            goto cleanup;
+        }
+        if (!InitializeProcThreadAttributeList(attribute_list, 1, 0,
+                                               &attribute_list_size)) {
+            cg_set_error(result, GetLastError());
+            result->status = CG_STATUS_START_FAILED;
+            goto cleanup;
+        }
+        attribute_list_initialized = 1;
+        if (!UpdateProcThreadAttribute(
+                attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                inherited_handles,
+                inherited_handle_count * sizeof(inherited_handles[0]), NULL,
+                NULL)) {
+            cg_set_error(result, GetLastError());
+            result->status = CG_STATUS_START_FAILED;
+            goto cleanup;
+        }
+        startup_info.StartupInfo.cb = sizeof(startup_info);
+        startup_info.lpAttributeList = attribute_list;
+    } else {
+        startup_info.StartupInfo.cb = sizeof(startup_info.StartupInfo);
+    }
+
+    if (!CreateProcessW(
+            NULL, command_line.data, NULL, NULL,
+            inherited_handle_count > 0,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
+                (inherited_handle_count > 0 ? EXTENDED_STARTUPINFO_PRESENT : 0),
+            NULL, NULL, &startup_info.StartupInfo, &process_info)) {
         cg_set_error(result, GetLastError());
         result->status = CG_STATUS_START_FAILED;
         goto cleanup;
@@ -1125,6 +1228,15 @@ cleanup:
     if (job_metrics != NULL && job_assigned && job != NULL) {
         cg_collect_job_metrics(job, job_metrics, query_job_information);
     }
+    if (attribute_list_initialized) {
+        DeleteProcThreadAttributeList(attribute_list);
+    }
+    if (attribute_list != NULL) {
+        HeapFree(GetProcessHeap(), 0, attribute_list);
+    }
+    cg_close_child_handle(stdin_handle, child_stdin_handle);
+    cg_close_child_handle(stdout_handle, child_stdout_handle);
+    cg_close_child_handle(stderr_handle, child_stderr_handle);
     if (thread != NULL) {
         CloseHandle(thread);
     }
