@@ -81,14 +81,14 @@ static int parent_main(void)
     wchar_t standard_names[3][128];
     const wchar_t *child_argv[4];
     HANDLE original_standard[3];
-    HANDLE standard_events[3] = {NULL, NULL, NULL};
+    HANDLE standard_events[3];
     HANDLE ready = NULL;
     HANDLE release = NULL;
     HANDLE worker = NULL;
     run_context context;
     const wchar_t *failure = L"unknown failure";
     DWORD process_id = GetCurrentProcessId();
-    DWORD nonce = GetTickCount();
+    ULONGLONG nonce = GetTickCount64();
     DWORD wait_result;
     size_t index;
     int standards_installed = 0;
@@ -96,6 +96,8 @@ static int parent_main(void)
     int status = 1;
 
     ZeroMemory(&context, sizeof(context));
+    ZeroMemory(original_standard, sizeof(original_standard));
+    ZeroMemory(standard_events, sizeof(standard_events));
     context.api_result = -1;
     if (GetModuleFileNameW(NULL, executable,
                            sizeof(executable) / sizeof(executable[0])) == 0) {
@@ -103,12 +105,12 @@ static int parent_main(void)
         goto cleanup;
     }
     if (swprintf_s(ready_name, sizeof(ready_name) / sizeof(ready_name[0]),
-                   L"Local\\CoreguardHandleLifetime-%lu-%lu-ready",
-                   (unsigned long)process_id, (unsigned long)nonce) < 0 ||
+                   L"Local\\CoreguardHandleLifetime-%lu-%llu-ready",
+                   (unsigned long)process_id, (unsigned long long)nonce) < 0 ||
         swprintf_s(release_name,
                    sizeof(release_name) / sizeof(release_name[0]),
-                   L"Local\\CoreguardHandleLifetime-%lu-%lu-release",
-                   (unsigned long)process_id, (unsigned long)nonce) < 0) {
+                   L"Local\\CoreguardHandleLifetime-%lu-%llu-release",
+                   (unsigned long)process_id, (unsigned long long)nonce) < 0) {
         failure = L"event name formatting failed";
         goto cleanup;
     }
@@ -116,8 +118,8 @@ static int parent_main(void)
         if (swprintf_s(standard_names[index],
                        sizeof(standard_names[index]) /
                            sizeof(standard_names[index][0]),
-                       L"Local\\CoreguardHandleLifetime-%lu-%lu-%ls",
-                       (unsigned long)process_id, (unsigned long)nonce,
+                       L"Local\\CoreguardHandleLifetime-%lu-%llu-%ls",
+                       (unsigned long)process_id, (unsigned long long)nonce,
                        standard_suffixes[index]) < 0) {
             failure = L"standard event name formatting failed";
             goto cleanup;
