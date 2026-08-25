@@ -1092,6 +1092,12 @@ static int cg_windows_run_internal(
         result->status = CG_STATUS_START_FAILED;
         goto cleanup;
     }
+    cg_close_child_handle(stdin_handle, child_stdin_handle);
+    child_stdin_handle = NULL;
+    cg_close_child_handle(stdout_handle, child_stdout_handle);
+    child_stdout_handle = NULL;
+    cg_close_child_handle(stderr_handle, child_stderr_handle);
+    child_stderr_handle = NULL;
     process_started = 1;
     process = process_info.hProcess;
     thread = process_info.hThread;

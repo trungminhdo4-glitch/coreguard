@@ -144,6 +144,17 @@ class PublicConsumerTests(unittest.TestCase):
                 finally:
                     temporary.cleanup()
 
+    def test_parent_releases_child_handle_duplicates_while_run_is_active(self) -> None:
+        temporary, executable, completed = self.compile_consumer(
+            CONSUMERS / "handle_lifetime" / "main.c",
+            PUBLIC_HEADER,
+        )
+        try:
+            self.assert_compile_success(self, completed)
+            self.assert_runs(executable)
+        finally:
+            temporary.cleanup()
+
     def test_cpp_and_header_self_containment(self) -> None:
         cases = (
             ("cpp_basic", "main.cpp", True, True),
