@@ -946,7 +946,8 @@ static int cg_windows_run_internal(
     cpu_time_limit_enabled = cg_cpu_time_limit_enabled(resource_limits);
     active_process_limit_enabled =
         cg_active_process_limit_enabled(resource_limits);
-    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled;
+    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled ||
+                           active_process_limit_enabled;
 
     job = CreateJobObjectW(NULL, NULL);
     if (job == NULL) {
