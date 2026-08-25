@@ -51,7 +51,7 @@ static int parse_positive_uint64(const wchar_t *text, uint64_t maximum,
 
 static int parse_timeout(const wchar_t *text, uint64_t *value_out)
 {
-    return parse_positive_uint64(text, UINT32_MAX, value_out);
+    return parse_positive_uint64(text, UINT32_MAX - UINT32_C(1), value_out);
 }
 
 static int parse_memory_limit_mb(const wchar_t *text,

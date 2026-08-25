@@ -711,6 +711,7 @@ class CoreguardTests(unittest.TestCase):
             "1 ",
             "\t1",
             "1\t",
+            "4294967295",
             "4294967296",
             "18446744073709551616",
         ]
@@ -722,7 +723,7 @@ class CoreguardTests(unittest.TestCase):
                 self.assertEqual(completed.stdout, "")
 
     def test_timeout_parser_accepts_valid_boundaries(self) -> None:
-        for value in ("1", "4294967295"):
+        for value in ("1", "4294967294"):
             with self.subTest(value=value):
                 completed = self.run_cli_option("--timeout-ms", value)
                 self.assertEqual(completed.returncode, 125)

@@ -90,7 +90,8 @@ static int cg_run_internal(const cg_run_options *options,
     }
 
     if (options == NULL || options->argv == NULL || options->argc == 0 ||
-        options->timeout_ms == 0 || options->timeout_ms > UINT32_MAX ||
+        options->timeout_ms == 0 ||
+        options->timeout_ms > UINT32_MAX - UINT32_C(1) ||
         !cg_resource_limits_valid(options->resource_limits)) {
         result->status = CG_STATUS_USAGE_ERROR;
         return 0;
