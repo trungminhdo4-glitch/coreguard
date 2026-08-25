@@ -221,10 +221,14 @@ cleanup:
             SetStdHandle(standard_ids[index], original_standard[index]);
         }
     }
-    for (index = 0; index < 3U; ++index) {
-        if (standard_events[index] != NULL) {
-            CloseHandle(standard_events[index]);
-        }
+    if (standard_events[0] != NULL) {
+        CloseHandle(standard_events[0]);
+    }
+    if (standard_events[1] != NULL) {
+        CloseHandle(standard_events[1]);
+    }
+    if (standard_events[2] != NULL) {
+        CloseHandle(standard_events[2]);
     }
     if (release != NULL) {
         SetEvent(release);
