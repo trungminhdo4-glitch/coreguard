@@ -227,15 +227,6 @@ cleanup:
             SetStdHandle(standard_ids[index], original_standard[index]);
         }
     }
-    if (standard_stdin != NULL) {
-        CloseHandle(standard_stdin);
-    }
-    if (standard_stdout != NULL) {
-        CloseHandle(standard_stdout);
-    }
-    if (standard_stderr != NULL) {
-        CloseHandle(standard_stderr);
-    }
     if (release != NULL) {
         SetEvent(release);
     }
