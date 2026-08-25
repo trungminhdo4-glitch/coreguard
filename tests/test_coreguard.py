@@ -135,6 +135,27 @@ class CoreguardTests(unittest.TestCase):
         )
         return payload, completed
 
+    def run_cli_option(
+        self, option: str, value: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(self.exe),
+                "run",
+                "--json",
+                option,
+                value,
+                "--",
+                "definitely-not-a-real-coreguard-executable.exe",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=20,
+            check=False,
+        )
+
     @staticmethod
     def read_report(path: pathlib.Path) -> dict:
         deadline = time.monotonic() + 3
@@ -679,32 +700,66 @@ class CoreguardTests(unittest.TestCase):
             self.assertTrue(payload["resource_limit_hit"])
             self.assertTrue(payload["cleanup_ok"])
 
-    def test_invalid_memory_limit_values_fail_before_spawn(self) -> None:
-        invalid_values = ["0", "-1", "not-a-number", "18446744073709551615"]
+    def test_timeout_parser_rejects_non_decimal_and_out_of_range_values(self) -> None:
+        invalid_values = [
+            "0",
+            "+1",
+            "-1",
+            "-18446744073709551615",
+            " -18446744073709551615",
+            " 1",
+            "1 ",
+            "\t1",
+            "1\t",
+            "4294967296",
+            "18446744073709551616",
+        ]
         for value in invalid_values:
-            completed = subprocess.run(
-                [
-                    str(self.exe),
-                    "run",
-                    "--json",
-                    "--memory-limit-mb",
-                    value,
-                    "--",
-                    "cmd.exe",
-                    "/d",
-                    "/c",
-                    "exit 0",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="strict",
-                timeout=20,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 2, value)
-            self.assertIn("invalid --memory-limit-mb", completed.stderr)
-            self.assertEqual(completed.stdout, "")
+            with self.subTest(value=value):
+                completed = self.run_cli_option("--timeout-ms", value)
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("invalid --timeout-ms", completed.stderr)
+                self.assertEqual(completed.stdout, "")
+
+    def test_timeout_parser_accepts_valid_boundaries(self) -> None:
+        for value in ("1", "4294967295"):
+            with self.subTest(value=value):
+                completed = self.run_cli_option("--timeout-ms", value)
+                self.assertEqual(completed.returncode, 125)
+                self.assertEqual(completed.stderr, "")
+                self.assertEqual(json.loads(completed.stdout)["status"], "start_failed")
+
+    def test_memory_parser_rejects_non_decimal_and_out_of_range_values(self) -> None:
+        invalid_values = [
+            "0",
+            "+1",
+            "-1",
+            "-18446744073709551615",
+            " -18446744073709551615",
+            " 1",
+            "1 ",
+            "\t1",
+            "1\t",
+            "not-a-number",
+            "17592186044416",
+            "18446744073709551616",
+        ]
+        for value in invalid_values:
+            with self.subTest(value=value):
+                completed = self.run_cli_option("--memory-limit-mb", value)
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("invalid --memory-limit-mb", completed.stderr)
+                self.assertEqual(completed.stdout, "")
+
+    def test_memory_parser_accepts_valid_boundaries(self) -> None:
+        for value in ("1", "17592186044415"):
+            with self.subTest(value=value):
+                completed = self.run_cli_option("--memory-limit-mb", value)
+                self.assertEqual(completed.returncode, 125)
+                self.assertEqual(completed.stderr, "")
+                self.assertEqual(json.loads(completed.stdout)["status"], "start_failed")
+
+    def test_duplicate_memory_limit_fails_before_spawn(self) -> None:
 
         duplicate = subprocess.run(
             [

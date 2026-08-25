@@ -1,7 +1,6 @@
 #include "coreguard.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define CG_DEFAULT_TIMEOUT_MS 120000ULL
@@ -23,48 +22,8 @@ static void print_usage(FILE *stream)
             "--max-processes applies to simultaneously active processes; the root counts.\n");
 }
 
-static int parse_timeout(const wchar_t *text, uint64_t *value_out)
-{
-    wchar_t *end = NULL;
-    unsigned long long value;
-
-    if (text == NULL || text[0] == L'\0') {
-        return 0;
-    }
-    value = wcstoull(text, &end, 10);
-    if (end == text || *end != L'\0' || value == 0 || value > UINT32_MAX) {
-        return 0;
-    }
-    *value_out = (uint64_t)value;
-    return 1;
-}
-
-static int parse_memory_limit_mb(const wchar_t *text,
-                                 cg_resource_limits *limits)
-{
-    wchar_t *end = NULL;
-    unsigned long long value;
-    const uint64_t bytes_per_mb = UINT64_C(1024) * UINT64_C(1024);
-
-    if (text == NULL || text[0] == L'\0' || text[0] == L'-') {
-        return 0;
-    }
-    value = wcstoull(text, &end, 10);
-    if (end == text || *end != L'\0' || value == 0U ||
-        (uint64_t)value > UINT64_MAX / bytes_per_mb) {
-        return 0;
-    }
-    limits->memory_limit_bytes = (uint64_t)value * bytes_per_mb;
-    if (limits->memory_limit_bytes == 0U ||
-        limits->memory_limit_bytes == UINT64_MAX) {
-        return 0;
-    }
-    limits->valid_limits |= CG_RESOURCE_LIMIT_MEMORY;
-    return 1;
-}
-
-static int parse_cpu_time_limit_ms(const wchar_t *text,
-                                   cg_resource_limits *limits)
+static int parse_positive_uint64(const wchar_t *text, uint64_t maximum,
+                                 uint64_t *value_out)
 {
     uint64_t value = 0;
     size_t index;
@@ -83,7 +42,38 @@ static int parse_cpu_time_limit_ms(const wchar_t *text,
         }
         value = value * UINT64_C(10) + (uint64_t)digit;
     }
-    if (value == 0U || value > CG_RESOURCE_CPU_TIME_MAX_MS) {
+    if (value == 0U || value > maximum) {
+        return 0;
+    }
+    *value_out = value;
+    return 1;
+}
+
+static int parse_timeout(const wchar_t *text, uint64_t *value_out)
+{
+    return parse_positive_uint64(text, UINT32_MAX, value_out);
+}
+
+static int parse_memory_limit_mb(const wchar_t *text,
+                                  cg_resource_limits *limits)
+{
+    uint64_t value;
+    const uint64_t bytes_per_mb = UINT64_C(1024) * UINT64_C(1024);
+
+    if (!parse_positive_uint64(text, UINT64_MAX / bytes_per_mb, &value)) {
+        return 0;
+    }
+    limits->memory_limit_bytes = value * bytes_per_mb;
+    limits->valid_limits |= CG_RESOURCE_LIMIT_MEMORY;
+    return 1;
+}
+
+static int parse_cpu_time_limit_ms(const wchar_t *text,
+                                   cg_resource_limits *limits)
+{
+    uint64_t value;
+
+    if (!parse_positive_uint64(text, CG_RESOURCE_CPU_TIME_MAX_MS, &value)) {
         return 0;
     }
     limits->cpu_time_limit_ms = value;
@@ -94,24 +84,9 @@ static int parse_cpu_time_limit_ms(const wchar_t *text,
 static int parse_active_process_limit(const wchar_t *text,
                                       cg_resource_limits *limits)
 {
-    uint64_t value = 0;
-    size_t index;
-    unsigned int digit;
+    uint64_t value;
 
-    if (text == NULL || text[0] == L'\0') {
-        return 0;
-    }
-    for (index = 0; text[index] != L'\0'; index++) {
-        if (text[index] < L'0' || text[index] > L'9') {
-            return 0;
-        }
-        digit = (unsigned int)(text[index] - L'0');
-        if (value > (UINT64_MAX - (uint64_t)digit) / UINT64_C(10)) {
-            return 0;
-        }
-        value = value * UINT64_C(10) + (uint64_t)digit;
-    }
-    if (value == 0U || value > UINT32_MAX) {
+    if (!parse_positive_uint64(text, UINT32_MAX, &value)) {
         return 0;
     }
     limits->active_process_limit = (uint32_t)value;
