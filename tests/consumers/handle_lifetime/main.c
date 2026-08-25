@@ -81,7 +81,14 @@ static int parent_main(void)
     wchar_t standard_names[3][128];
     const wchar_t *child_argv[4];
     HANDLE original_standard[3];
-    HANDLE standard_events[3];
+    HANDLE standard_stdin = NULL;
+    HANDLE standard_stdout = NULL;
+    HANDLE standard_stderr = NULL;
+    HANDLE *standard_events[3] = {
+        &standard_stdin,
+        &standard_stdout,
+        &standard_stderr,
+    };
     HANDLE ready = NULL;
     HANDLE release = NULL;
     HANDLE worker = NULL;
@@ -97,7 +104,6 @@ static int parent_main(void)
 
     ZeroMemory(&context, sizeof(context));
     ZeroMemory(original_standard, sizeof(original_standard));
-    ZeroMemory(standard_events, sizeof(standard_events));
     context.api_result = -1;
     if (GetModuleFileNameW(NULL, executable,
                            sizeof(executable) / sizeof(executable[0])) == 0) {
@@ -124,9 +130,9 @@ static int parent_main(void)
             failure = L"standard event name formatting failed";
             goto cleanup;
         }
-        standard_events[index] =
+        *standard_events[index] =
             CreateEventW(NULL, TRUE, FALSE, standard_names[index]);
-        if (standard_events[index] == NULL) {
+        if (*standard_events[index] == NULL) {
             failure = L"standard event creation failed";
             goto cleanup;
         }
@@ -141,7 +147,7 @@ static int parent_main(void)
 
     standards_installed = 1;
     for (index = 0; index < 3U; ++index) {
-        if (!SetStdHandle(standard_ids[index], standard_events[index])) {
+        if (!SetStdHandle(standard_ids[index], *standard_events[index])) {
             failure = L"standard handle installation failed";
             goto cleanup;
         }
@@ -174,8 +180,8 @@ static int parent_main(void)
     }
     standards_installed = 0;
     for (index = 0; index < 3U; ++index) {
-        CloseHandle(standard_events[index]);
-        standard_events[index] = NULL;
+        CloseHandle(*standard_events[index]);
+        *standard_events[index] = NULL;
     }
 
     if (WaitForSingleObject(worker, 0U) != WAIT_TIMEOUT) {
@@ -221,14 +227,14 @@ cleanup:
             SetStdHandle(standard_ids[index], original_standard[index]);
         }
     }
-    if (standard_events[0] != NULL) {
-        CloseHandle(standard_events[0]);
+    if (standard_stdin != NULL) {
+        CloseHandle(standard_stdin);
     }
-    if (standard_events[1] != NULL) {
-        CloseHandle(standard_events[1]);
+    if (standard_stdout != NULL) {
+        CloseHandle(standard_stdout);
     }
-    if (standard_events[2] != NULL) {
-        CloseHandle(standard_events[2]);
+    if (standard_stderr != NULL) {
+        CloseHandle(standard_stderr);
     }
     if (release != NULL) {
         SetEvent(release);
