@@ -42,7 +42,7 @@ static int child_main(const wchar_t *ready_name, const wchar_t *release_name)
          ++index) {
         HANDLE handle = GetStdHandle(standard_ids[index]);
         if (handle == NULL || handle == INVALID_HANDLE_VALUE ||
-            !SetStdHandle(standard_ids[index], NULL) || !CloseHandle(handle)) {
+            !CloseHandle(handle)) {
             status = 11;
             goto cleanup;
         }
