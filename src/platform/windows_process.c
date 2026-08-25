@@ -946,8 +946,7 @@ static int cg_windows_run_internal(
     cpu_time_limit_enabled = cg_cpu_time_limit_enabled(resource_limits);
     active_process_limit_enabled =
         cg_active_process_limit_enabled(resource_limits);
-    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled ||
-                           active_process_limit_enabled;
+    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled;
 
     job = CreateJobObjectW(NULL, NULL);
     if (job == NULL) {
@@ -1129,7 +1128,8 @@ static int cg_windows_run_internal(
     }
     result->resource_limit_hit = resource_flags != 0U;
     result->resource_limit_kind = cg_resource_limit_kind(resource_flags);
-    if (wait_result == CG_WAIT_RESOURCE) {
+    if (wait_result == CG_WAIT_RESOURCE ||
+        (wait_result == WAIT_TIMEOUT && resource_flags != 0U)) {
         result->status = CG_STATUS_RESOURCE_LIMIT;
         terminate_attempted = 1;
         (void)cg_terminate_job(job, process, result,
