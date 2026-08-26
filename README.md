@@ -97,6 +97,22 @@ int main(void)
 must be linked with a matching MSVC runtime configuration. There is no DLL or
 import-library contract.
 
+Captured stdout and stderr are bounded independently. Coreguard retains the
+first 1 MiB of raw bytes from each stream while continuously draining and
+discarding excess bytes; `output_truncated` is set when either stream exceeds
+that limit. CR and CRLF newline normalization is applied after the raw-byte
+limit, so a returned stream can be smaller than its retained raw prefix.
+
+After the controlled job exits, capture readers get a short drain period.
+Coreguard then repeatedly signals them to stop, cancels synchronous reads, and
+polls for confirmed termination for up to five seconds per reader. If Windows
+still cannot confirm termination, the reader's buffers and handles are rarely
+quarantined instead of being freed unsafely. Reaping checks a fixed number of
+quarantined readers per invocation. Sixteen reader slots are shared by active
+and quarantined captures; if no two slots are available, a new captured run
+fails with an internal `ERROR_NOT_ENOUGH_QUOTA` result before its process is
+created. Runs without output capture do not consume these slots.
+
 ## CLI
 
 Coreguard starts the command after it has established the Job Object boundary;

@@ -1208,7 +1208,7 @@ def run_failure_injection(exe: pathlib.Path) -> dict[str, Any]:
         "tested": ["invalid executable", "process exit near timeout decision"],
         "untested": [
             "invalid working directory: CLI has no working-directory option",
-            "pipe/output failure: capture uses bounded temporary files",
+            "pipe read failure: covered by the private native hook suite, not this CLI runner",
             "job assignment failure: not safely injectable without system mutation",
         ],
         "child_exit_codes": [completed.returncode, race_completed.returncode],

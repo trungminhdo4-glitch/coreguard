@@ -18,9 +18,16 @@
 #define CG_RESOURCE_POLL_MS 5U
 #define CG_RESOURCE_TERMINATION_CODE 123U
 #define CG_WAIT_RESOURCE 0x10000U
+#define CG_WAIT_OUTPUT 0x10001U
 #define CG_RESOURCE_FLAG_MEMORY 0x1U
 #define CG_RESOURCE_FLAG_CPU_TIME 0x2U
 #define CG_RESOURCE_FLAG_ACTIVE_PROCESSES 0x4U
+#define CG_CAPTURE_READ_SIZE 8192U
+#define CG_CAPTURE_DRAIN_GRACE_MS 100U
+#define CG_CAPTURE_CANCEL_GRACE_MS 5000U
+#define CG_CAPTURE_CANCEL_POLL_MS 20U
+#define CG_CAPTURE_QUARANTINE_LIMIT 16L
+#define CG_CAPTURE_REAP_LIMIT 4U
 #define CG_FILETIME_UNIX_EPOCH_100NS UINT64_C(116444736000000000)
 #define CG_100NS_PER_MS UINT64_C(10000)
 
@@ -30,11 +37,28 @@ typedef struct cg_wbuilder {
     size_t capacity;
 } cg_wbuilder;
 
-typedef struct cg_capture_file {
-    HANDLE handle;
-    wchar_t path[MAX_PATH];
-    int active;
-} cg_capture_file;
+typedef struct cg_capture_pipe {
+    HANDLE read_handle;
+    HANDLE write_handle;
+    HANDLE thread;
+    HANDLE stop_event;
+    HANDLE failure_event;
+    cg_read_file_fn read_file;
+    char *data;
+    size_t size;
+    volatile LONG read_error;
+    volatile LONG truncated;
+    int thread_joined;
+    int slot_reserved;
+    int quarantined;
+    struct cg_capture_pipe *next_quarantined;
+} cg_capture_pipe;
+
+static SRWLOCK cg_capture_quarantine_lock = SRWLOCK_INIT;
+static cg_capture_pipe *cg_quarantined_captures;
+static cg_capture_pipe *cg_quarantined_captures_tail;
+static volatile LONG cg_capture_slots_used;
+static volatile LONG cg_quarantined_capture_count;
 
 _Static_assert(sizeof(SIZE_T) <= sizeof(uint64_t),
                "SIZE_T must fit in the public metric representation");
@@ -233,15 +257,33 @@ static int cg_check_cpu_accounting(HANDLE job, uint64_t limit_ticks,
 }
 
 static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
-                                 HANDLE job, uint64_t cpu_time_limit_ticks,
-                                 int poll_completion_port, DWORD timeout_ms,
-                                 uint32_t *resource_flags,
-                                 DWORD *error_out)
+                                  HANDLE job, uint64_t cpu_time_limit_ticks,
+                                  int poll_completion_port,
+                                  HANDLE output_failure_event,
+                                  DWORD timeout_ms,
+                                  uint32_t *resource_flags,
+                                  DWORD *error_out)
 {
     uint64_t deadline = cg_now_ms() + (uint64_t)timeout_ms;
 
     if (!poll_completion_port && cpu_time_limit_ticks == 0U) {
-        return WaitForSingleObject(process, timeout_ms);
+        DWORD wait_result;
+        if (output_failure_event == NULL) {
+            wait_result = WaitForSingleObject(process, timeout_ms);
+        } else {
+            HANDLE wait_handles[2];
+            wait_handles[0] = process;
+            wait_handles[1] = output_failure_event;
+            wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
+                                                 timeout_ms);
+            if (wait_result == WAIT_OBJECT_0 + 1U) {
+                return CG_WAIT_OUTPUT;
+            }
+        }
+        if (wait_result == WAIT_FAILED) {
+            *error_out = GetLastError();
+        }
+        return wait_result;
     }
 
     for (;;) {
@@ -259,6 +301,16 @@ static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
         }
         if (*resource_flags != 0U) {
             return CG_WAIT_RESOURCE;
+        }
+        if (output_failure_event != NULL) {
+            wait_result = WaitForSingleObject(output_failure_event, 0);
+            if (wait_result == WAIT_FAILED) {
+                *error_out = GetLastError();
+                return WAIT_FAILED;
+            }
+            if (wait_result == WAIT_OBJECT_0) {
+                return CG_WAIT_OUTPUT;
+            }
         }
 
         if (now >= deadline) {
@@ -282,6 +334,17 @@ static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
             if (*resource_flags != 0U) {
                 return CG_WAIT_RESOURCE;
             }
+            if (output_failure_event != NULL) {
+                DWORD output_wait =
+                    WaitForSingleObject(output_failure_event, 0);
+                if (output_wait == WAIT_FAILED) {
+                    *error_out = GetLastError();
+                    return WAIT_FAILED;
+                }
+                if (output_wait == WAIT_OBJECT_0) {
+                    return CG_WAIT_OUTPUT;
+                }
+            }
             return wait_result == WAIT_OBJECT_0 ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
         }
 
@@ -293,17 +356,36 @@ static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
             wait_ms = 1U;
         }
         if (!poll_completion_port && cpu_time_limit_ticks != 0U) {
-            HANDLE wait_handles[2];
+            HANDLE wait_handles[3];
+            DWORD handle_count = 2U;
             wait_handles[0] = process;
             wait_handles[1] = job;
-            wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
-                                                 wait_ms);
+            if (output_failure_event != NULL) {
+                wait_handles[handle_count++] = output_failure_event;
+            }
+            wait_result = WaitForMultipleObjects(handle_count, wait_handles,
+                                                 FALSE, wait_ms);
             if (wait_result == WAIT_OBJECT_0 + 1U) {
                 *resource_flags |= CG_RESOURCE_FLAG_CPU_TIME;
                 return CG_WAIT_RESOURCE;
             }
+            if (output_failure_event != NULL &&
+                wait_result == WAIT_OBJECT_0 + 2U) {
+                return CG_WAIT_OUTPUT;
+            }
         } else {
-            wait_result = WaitForSingleObject(process, wait_ms);
+            if (output_failure_event == NULL) {
+                wait_result = WaitForSingleObject(process, wait_ms);
+            } else {
+                HANDLE wait_handles[2];
+                wait_handles[0] = process;
+                wait_handles[1] = output_failure_event;
+                wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
+                                                     wait_ms);
+                if (wait_result == WAIT_OBJECT_0 + 1U) {
+                    return CG_WAIT_OUTPUT;
+                }
+            }
         }
         if (wait_result == WAIT_FAILED) {
             *error_out = GetLastError();
@@ -661,108 +743,455 @@ static int cg_build_command_line(const cg_run_options *options,
     return builder->length > 0;
 }
 
-static void cg_capture_init(cg_capture_file *capture)
+static void cg_capture_init(cg_capture_pipe *capture)
 {
-    capture->handle = INVALID_HANDLE_VALUE;
-    capture->path[0] = L'\0';
-    capture->active = 0;
+    capture->read_handle = INVALID_HANDLE_VALUE;
+    capture->write_handle = INVALID_HANDLE_VALUE;
+    capture->thread = NULL;
+    capture->stop_event = NULL;
+    capture->failure_event = NULL;
+    capture->read_file = NULL;
+    capture->data = NULL;
+    capture->size = 0U;
+    capture->read_error = (LONG)ERROR_SUCCESS;
+    capture->truncated = 0;
+    capture->thread_joined = 0;
+    capture->slot_reserved = 0;
+    capture->quarantined = 0;
+    capture->next_quarantined = NULL;
 }
 
-static int cg_capture_create(cg_capture_file *capture)
+static int cg_capture_reserve_slots(cg_capture_pipe *stdout_capture,
+                                    cg_capture_pipe *stderr_capture)
 {
-    SECURITY_ATTRIBUTES attributes;
-    wchar_t temp_directory[MAX_PATH];
-    DWORD length;
+    LONG current;
 
-    length = GetTempPathW((DWORD)_countof(temp_directory), temp_directory);
-    if (length == 0 || length >= _countof(temp_directory)) {
+    if (stdout_capture == NULL || stderr_capture == NULL) {
         return 0;
     }
-    if (GetTempFileNameW(temp_directory, L"cg", 0, capture->path) == 0) {
+    for (;;) {
+        current = InterlockedCompareExchange(&cg_capture_slots_used, 0, 0);
+        if (current > CG_CAPTURE_QUARANTINE_LIMIT - 2L) {
+            return 0;
+        }
+        if (InterlockedCompareExchange(&cg_capture_slots_used, current + 2L,
+                                       current) == current) {
+            stdout_capture->slot_reserved = 1;
+            stderr_capture->slot_reserved = 1;
+            return 1;
+        }
+    }
+}
+
+static void cg_capture_release_slot(cg_capture_pipe *capture)
+{
+    if (capture->quarantined) {
+        capture->quarantined = 0;
+        (void)InterlockedDecrement(&cg_quarantined_capture_count);
+    }
+    if (capture->slot_reserved) {
+        capture->slot_reserved = 0;
+        (void)InterlockedDecrement(&cg_capture_slots_used);
+    }
+}
+
+static void cg_capture_destroy(cg_capture_pipe *capture)
+{
+    if (capture == NULL) {
+        return;
+    }
+    if (capture->thread != NULL && !capture->thread_joined) {
+        return;
+    }
+    if (capture->thread != NULL) {
+        CloseHandle(capture->thread);
+    }
+    if (capture->read_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(capture->read_handle);
+    }
+    if (capture->write_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(capture->write_handle);
+    }
+    if (capture->stop_event != NULL) {
+        CloseHandle(capture->stop_event);
+    }
+    if (capture->failure_event != NULL) {
+        CloseHandle(capture->failure_event);
+    }
+    free(capture->data);
+    free(capture);
+}
+
+static int cg_capture_create(cg_capture_pipe **capture_out, DWORD *error_out)
+{
+    cg_capture_pipe *capture;
+    SECURITY_ATTRIBUTES attributes;
+
+    *capture_out = NULL;
+    capture = (cg_capture_pipe *)calloc(1U, sizeof(*capture));
+    if (capture == NULL) {
+        *error_out = ERROR_NOT_ENOUGH_MEMORY;
+        return 0;
+    }
+    cg_capture_init(capture);
+    capture->data = (char *)malloc((size_t)CG_OUTPUT_LIMIT + 1U);
+    if (capture->data == NULL) {
+        *error_out = ERROR_NOT_ENOUGH_MEMORY;
+        cg_capture_destroy(capture);
+        return 0;
+    }
+    capture->data[0] = '\0';
+    capture->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (capture->stop_event == NULL) {
+        *error_out = GetLastError();
+        cg_capture_destroy(capture);
         return 0;
     }
     ZeroMemory(&attributes, sizeof(attributes));
     attributes.nLength = sizeof(attributes);
-    /* The capture handle is retained by the parent for the readback.  It is
-       not itself a child handle; the spawn path creates an explicit,
-       child-only inheritable duplicate below. */
     attributes.bInheritHandle = FALSE;
-    capture->handle = CreateFileW(
-        capture->path,
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        &attributes,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_TEMPORARY,
-        NULL);
-    if (capture->handle == INVALID_HANDLE_VALUE) {
-        DeleteFileW(capture->path);
-        capture->path[0] = L'\0';
+    if (!CreatePipe(&capture->read_handle, &capture->write_handle,
+                    &attributes, 0)) {
+        *error_out = GetLastError();
+        cg_capture_destroy(capture);
         return 0;
     }
-    capture->active = 1;
+    *capture_out = capture;
     return 1;
 }
 
-static void cg_capture_close(cg_capture_file *capture)
+static int cg_capture_stop_requested(cg_capture_pipe *capture,
+                                     DWORD *error_out)
 {
-    if (capture->handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(capture->handle);
-        capture->handle = INVALID_HANDLE_VALUE;
+    DWORD wait_result = WaitForSingleObject(capture->stop_event, 0);
+
+    if (wait_result == WAIT_OBJECT_0) {
+        return 1;
     }
-    if (capture->active && capture->path[0] != L'\0') {
-        DeleteFileW(capture->path);
+    if (wait_result == WAIT_FAILED) {
+        *error_out = GetLastError();
+        return -1;
     }
-    capture->path[0] = L'\0';
-    capture->active = 0;
+    return 0;
 }
 
-static int cg_read_capture(cg_capture_file *capture, char **data_out,
-                           size_t *size_out, int *truncated_out,
+static void cg_capture_signal_failure(cg_capture_pipe *capture, DWORD error)
+{
+    (void)InterlockedExchange(&capture->read_error, (LONG)error);
+    if (capture->failure_event != NULL) {
+        (void)SetEvent(capture->failure_event);
+    }
+}
+
+static DWORD WINAPI cg_capture_reader(LPVOID parameter)
+{
+    cg_capture_pipe *capture;
+    char chunk[CG_CAPTURE_READ_SIZE];
+
+    if (parameter == NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    capture = (cg_capture_pipe *)parameter;
+    if (capture->data == NULL ||
+        capture->read_handle == INVALID_HANDLE_VALUE ||
+        capture->stop_event == NULL ||
+        capture->failure_event == NULL || capture->read_file == NULL) {
+        cg_capture_signal_failure(capture, ERROR_INVALID_HANDLE);
+        return ERROR_INVALID_HANDLE;
+    }
+    for (;;) {
+        DWORD bytes_read = 0U;
+        size_t copy_size;
+        size_t remaining;
+        DWORD error = ERROR_SUCCESS;
+        DWORD stop_error = ERROR_SUCCESS;
+        int stop_requested = cg_capture_stop_requested(capture, &error);
+
+        if (stop_requested > 0) {
+            break;
+        }
+        if (stop_requested < 0) {
+            cg_capture_signal_failure(capture, error);
+            break;
+        }
+
+        if (!capture->read_file(capture->read_handle, chunk,
+                                (DWORD)sizeof(chunk), &bytes_read, NULL)) {
+            error = GetLastError();
+            if (error == ERROR_BROKEN_PIPE) {
+                break;
+            }
+            stop_requested = cg_capture_stop_requested(capture, &stop_error);
+            if (error == ERROR_OPERATION_ABORTED && stop_requested > 0) {
+                break;
+            }
+            if (stop_requested < 0) {
+                error = stop_error;
+            }
+            cg_capture_signal_failure(capture, error);
+            break;
+        }
+        if (bytes_read == 0U) {
+            break;
+        }
+        if (bytes_read > (DWORD)sizeof(chunk)) {
+            cg_capture_signal_failure(capture, ERROR_INVALID_DATA);
+            break;
+        }
+        remaining = capture->size < (size_t)CG_OUTPUT_LIMIT
+                        ? (size_t)CG_OUTPUT_LIMIT - capture->size
+                        : 0U;
+        copy_size = (size_t)bytes_read;
+        if (copy_size > remaining) {
+            copy_size = remaining;
+        }
+        if (copy_size > 0U) {
+            memcpy(capture->data + capture->size, chunk, copy_size);
+            capture->size += copy_size;
+        }
+        if (copy_size < (size_t)bytes_read) {
+            (void)InterlockedExchange(&capture->truncated, 1);
+        }
+    }
+    capture->data[capture->size] = '\0';
+    return 0U;
+}
+
+static int cg_capture_start(cg_capture_pipe *capture, HANDLE failure_event,
+                            cg_read_file_fn read_file, DWORD *error_out)
+{
+    capture->read_file = read_file;
+    if (!DuplicateHandle(GetCurrentProcess(), failure_event,
+                         GetCurrentProcess(), &capture->failure_event, 0,
+                         FALSE, DUPLICATE_SAME_ACCESS)) {
+        *error_out = GetLastError();
+        return 0;
+    }
+    capture->thread = CreateThread(NULL, 0, cg_capture_reader, capture, 0,
+                                   NULL);
+    if (capture->thread == NULL) {
+        *error_out = GetLastError();
+        CloseHandle(capture->failure_event);
+        capture->failure_event = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static int cg_capture_close_write(cg_capture_pipe *capture, DWORD *error_out)
+{
+    if (capture->write_handle == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+    if (!CloseHandle(capture->write_handle)) {
+        *error_out = GetLastError();
+        return 0;
+    }
+    capture->write_handle = INVALID_HANDLE_VALUE;
+    return 1;
+}
+
+static int cg_capture_join(cg_capture_pipe *capture,
+                           cg_wait_single_fn wait_single,
+                           cg_cancel_synchronous_io_fn cancel_io,
+                           DWORD cancel_grace_ms,
                            DWORD *error_out)
 {
-    LARGE_INTEGER file_size;
-    DWORD to_read;
-    DWORD bytes_read = 0;
-    char *data;
-    LARGE_INTEGER file_offset;
+    DWORD wait_result;
+    DWORD operation_error = ERROR_SUCCESS;
+    uint64_t deadline;
 
-    *data_out = NULL;
-    *size_out = 0;
-    *truncated_out = 0;
     *error_out = ERROR_SUCCESS;
-    file_offset.QuadPart = 0;
-    if (!SetFilePointerEx(capture->handle, file_offset, NULL, FILE_BEGIN) ||
-        !GetFileSizeEx(capture->handle, &file_size)) {
-        *error_out = GetLastError();
+    if (capture == NULL) {
+        return 1;
+    }
+    if (capture->thread == NULL) {
+        capture->thread_joined = 1;
+        return 1;
+    }
+    wait_result = wait_single(capture->thread, CG_CAPTURE_DRAIN_GRACE_MS);
+    if (wait_result == WAIT_OBJECT_0) {
+        capture->thread_joined = 1;
+        return 1;
+    }
+    if (wait_result == WAIT_FAILED) {
+        operation_error = GetLastError();
+        if (operation_error == ERROR_SUCCESS) {
+            operation_error = ERROR_GEN_FAILURE;
+        }
+    } else if (wait_result != WAIT_TIMEOUT) {
+        operation_error = ERROR_GEN_FAILURE;
+    }
+    deadline = cg_now_ms() + (uint64_t)cancel_grace_ms;
+    for (;;) {
+        uint64_t now;
+        uint64_t remaining;
+        DWORD wait_ms;
+
+        if (!SetEvent(capture->stop_event) && operation_error == ERROR_SUCCESS) {
+            operation_error = GetLastError();
+        }
+        if (!cancel_io(capture->thread)) {
+            DWORD cancel_error = GetLastError();
+            if (cancel_error != ERROR_NOT_FOUND &&
+                operation_error == ERROR_SUCCESS) {
+                operation_error = cancel_error;
+            }
+        }
+        now = cg_now_ms();
+        remaining = now < deadline ? deadline - now : 0U;
+        wait_ms = remaining > CG_CAPTURE_CANCEL_POLL_MS
+                      ? CG_CAPTURE_CANCEL_POLL_MS
+                      : (DWORD)remaining;
+        wait_result = wait_single(capture->thread, wait_ms);
+        if (wait_result == WAIT_OBJECT_0) {
+            capture->thread_joined = 1;
+            *error_out = operation_error;
+            return 1;
+        }
+        if (wait_result == WAIT_FAILED) {
+            *error_out = GetLastError();
+            if (*error_out == ERROR_SUCCESS) {
+                *error_out = ERROR_GEN_FAILURE;
+            }
+            return 0;
+        }
+        if (wait_result != WAIT_TIMEOUT) {
+            *error_out = ERROR_GEN_FAILURE;
+            return 0;
+        }
+        if (cg_now_ms() >= deadline) {
+            *error_out = operation_error == ERROR_SUCCESS ? WAIT_TIMEOUT
+                                                           : operation_error;
+            return 0;
+        }
+    }
+}
+
+static int cg_capture_take(cg_capture_pipe *capture, char **data_out,
+                           size_t *size_out, DWORD *error_out)
+{
+    LONG read_error = InterlockedCompareExchange(&capture->read_error, 0, 0);
+    int succeeded = read_error == (LONG)ERROR_SUCCESS;
+
+    if (capture->thread != NULL && !capture->thread_joined) {
+        *error_out = ERROR_BUSY;
         return 0;
     }
-    if (file_size.QuadPart < 0) {
-        *error_out = ERROR_INVALID_DATA;
+    if (!succeeded) {
+        *error_out = (DWORD)read_error;
+    }
+    *data_out = capture->data;
+    *size_out = capture->size;
+    capture->data = NULL;
+    capture->size = 0U;
+    return succeeded;
+}
+
+static int cg_capture_close(cg_capture_pipe *capture)
+{
+    if (capture == NULL) {
+        return 1;
+    }
+    if (capture->thread != NULL && !capture->thread_joined) {
         return 0;
     }
-    if ((unsigned long long)file_size.QuadPart > CG_OUTPUT_LIMIT) {
-        to_read = CG_OUTPUT_LIMIT;
-        *truncated_out = 1;
-    } else {
-        to_read = (DWORD)file_size.QuadPart;
+    if (capture->thread != NULL) {
+        CloseHandle(capture->thread);
+        capture->thread = NULL;
     }
-    data = (char *)malloc((size_t)to_read + 1U);
-    if (data == NULL) {
-        *error_out = ERROR_NOT_ENOUGH_MEMORY;
-        return 0;
+    if (capture->read_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(capture->read_handle);
+        capture->read_handle = INVALID_HANDLE_VALUE;
     }
-    if (to_read > 0 &&
-        (!ReadFile(capture->handle, data, to_read, &bytes_read, NULL) ||
-         bytes_read != to_read)) {
-        *error_out = GetLastError();
-        free(data);
-        return 0;
+    if (capture->write_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(capture->write_handle);
+        capture->write_handle = INVALID_HANDLE_VALUE;
     }
-    data[bytes_read] = '\0';
-    *data_out = data;
-    *size_out = bytes_read;
+    if (capture->stop_event != NULL) {
+        CloseHandle(capture->stop_event);
+        capture->stop_event = NULL;
+    }
+    if (capture->failure_event != NULL) {
+        CloseHandle(capture->failure_event);
+        capture->failure_event = NULL;
+    }
+    free(capture->data);
+    capture->data = NULL;
+    capture->size = 0U;
+    cg_capture_release_slot(capture);
+    free(capture);
     return 1;
+}
+
+static void cg_capture_quarantine(cg_capture_pipe *capture)
+{
+    if (capture == NULL) {
+        return;
+    }
+    AcquireSRWLockExclusive(&cg_capture_quarantine_lock);
+    capture->next_quarantined = NULL;
+    if (cg_quarantined_captures_tail != NULL) {
+        cg_quarantined_captures_tail->next_quarantined = capture;
+    } else {
+        cg_quarantined_captures = capture;
+    }
+    cg_quarantined_captures_tail = capture;
+    if (!capture->quarantined) {
+        capture->quarantined = 1;
+        (void)InterlockedIncrement(&cg_quarantined_capture_count);
+    }
+    ReleaseSRWLockExclusive(&cg_capture_quarantine_lock);
+}
+
+static void cg_capture_reap_quarantined(void)
+{
+    cg_capture_pipe *deferred = NULL;
+    cg_capture_pipe *deferred_tail = NULL;
+    unsigned int reaped;
+
+    for (reaped = 0U; reaped < CG_CAPTURE_REAP_LIMIT; reaped++) {
+        cg_capture_pipe *capture;
+        DWORD wait_result;
+
+        AcquireSRWLockExclusive(&cg_capture_quarantine_lock);
+        capture = cg_quarantined_captures;
+        if (capture != NULL) {
+            cg_quarantined_captures = capture->next_quarantined;
+            if (cg_quarantined_captures == NULL) {
+                cg_quarantined_captures_tail = NULL;
+            }
+        }
+        ReleaseSRWLockExclusive(&cg_capture_quarantine_lock);
+        if (capture == NULL) {
+            break;
+        }
+        capture->next_quarantined = NULL;
+        wait_result = capture->thread == NULL
+                          ? WAIT_OBJECT_0
+                          : WaitForSingleObject(capture->thread, 0);
+        if (wait_result == WAIT_OBJECT_0) {
+            capture->thread_joined = 1;
+            (void)cg_capture_close(capture);
+        } else {
+            if (deferred_tail != NULL) {
+                deferred_tail->next_quarantined = capture;
+            } else {
+                deferred = capture;
+            }
+            deferred_tail = capture;
+        }
+    }
+    if (deferred != NULL) {
+        AcquireSRWLockExclusive(&cg_capture_quarantine_lock);
+        if (cg_quarantined_captures_tail != NULL) {
+            cg_quarantined_captures_tail->next_quarantined = deferred;
+        } else {
+            cg_quarantined_captures = deferred;
+        }
+        cg_quarantined_captures_tail = deferred_tail;
+        ReleaseSRWLockExclusive(&cg_capture_quarantine_lock);
+    }
 }
 
 static void cg_normalize_newlines(char *data, size_t *size)
@@ -879,22 +1308,62 @@ static void cg_close_child_handle(HANDLE source, HANDLE child_handle)
     }
 }
 
+static int cg_terminate_unassigned_process(HANDLE process,
+                                            cg_run_result *result)
+{
+    DWORD wait_result;
+
+    if (!TerminateProcess(process, 125U)) {
+        DWORD error = GetLastError();
+        wait_result = WaitForSingleObject(process, 0);
+        if (wait_result != WAIT_OBJECT_0) {
+            cg_set_error(result, error == ERROR_SUCCESS ? ERROR_GEN_FAILURE
+                                                        : error);
+            result->cleanup_ok = 0;
+            return 0;
+        }
+        return 1;
+    }
+    wait_result = WaitForSingleObject(process, CG_TIMEOUT_GRACE_MS);
+    if (wait_result != WAIT_OBJECT_0) {
+        cg_set_error(result, wait_result == WAIT_FAILED ? GetLastError()
+                                                        : WAIT_TIMEOUT);
+        result->cleanup_ok = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static cg_windows_test_hooks cg_default_windows_hooks(void)
+{
+    cg_windows_test_hooks hooks;
+
+    hooks.query_job_information = cg_query_job_information;
+    hooks.read_file = ReadFile;
+    hooks.assign_process_to_job = AssignProcessToJobObject;
+    hooks.wait_capture_thread = WaitForSingleObject;
+    hooks.cancel_synchronous_io = CancelSynchronousIo;
+    hooks.capture_cancel_grace_ms = CG_CAPTURE_CANCEL_GRACE_MS;
+    return hooks;
+}
+
 static int cg_windows_run_internal(
     const cg_run_options *options,
     cg_run_result *result,
     cg_job_metrics *job_metrics,
-    cg_query_job_information_fn query_job_information)
+    const cg_windows_test_hooks *hooks)
 {
     HANDLE job = NULL;
     HANDLE completion_port = NULL;
+    HANDLE output_failure_event = NULL;
     HANDLE process = NULL;
     HANDLE thread = NULL;
     PROCESS_INFORMATION process_info;
     STARTUPINFOEXW startup_info;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     cg_wbuilder command_line;
-    cg_capture_file stdout_capture;
-    cg_capture_file stderr_capture;
+    cg_capture_pipe *stdout_capture = NULL;
+    cg_capture_pipe *stderr_capture = NULL;
     HANDLE stdin_handle;
     HANDLE stdout_handle;
     HANDLE stderr_handle;
@@ -914,6 +1383,7 @@ static int cg_windows_run_internal(
     int job_assigned = 0;
     int terminate_attempted = 0;
     int output_error = 0;
+    int capture_output_available = 0;
     uint32_t resource_flags = 0;
     int memory_limit_enabled;
     int cpu_time_limit_enabled;
@@ -921,6 +1391,17 @@ static int cg_windows_run_internal(
     int poll_completion_port;
     uint64_t cpu_time_limit_ticks = 0U;
     const cg_resource_limits *resource_limits = options->resource_limits;
+
+    cg_capture_reap_quarantined();
+    if (hooks == NULL || hooks->query_job_information == NULL ||
+        hooks->read_file == NULL || hooks->assign_process_to_job == NULL ||
+        hooks->wait_capture_thread == NULL ||
+        hooks->cancel_synchronous_io == NULL ||
+        hooks->capture_cancel_grace_ms == 0U) {
+        cg_set_error(result, ERROR_INVALID_PARAMETER);
+        result->status = CG_STATUS_INTERNAL_ERROR;
+        return 0;
+    }
 
     ZeroMemory(&process_info, sizeof(process_info));
     ZeroMemory(&startup_info, sizeof(startup_info));
@@ -938,8 +1419,6 @@ static int cg_windows_run_internal(
     attribute_list_size = 0;
     attribute_list = NULL;
     attribute_list_initialized = 0;
-    cg_capture_init(&stdout_capture);
-    cg_capture_init(&stderr_capture);
     result->status = CG_STATUS_INTERNAL_ERROR;
     result->cleanup_ok = 1;
     memory_limit_enabled = cg_memory_limit_enabled(resource_limits);
@@ -998,12 +1477,24 @@ static int cg_windows_run_internal(
         result->status = CG_STATUS_CONTAINMENT_FAILED;
         goto cleanup;
     }
-    if (options->capture_output &&
-        (!cg_capture_create(&stdout_capture) ||
-         !cg_capture_create(&stderr_capture))) {
-        cg_set_error(result, GetLastError());
-        result->status = CG_STATUS_INTERNAL_ERROR;
-        goto cleanup;
+    if (options->capture_output) {
+        if (!cg_capture_create(&stdout_capture, &last_error) ||
+            !cg_capture_create(&stderr_capture, &last_error)) {
+            cg_set_error(result, last_error);
+            result->status = CG_STATUS_INTERNAL_ERROR;
+            goto cleanup;
+        }
+        output_failure_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (output_failure_event == NULL) {
+            cg_set_error(result, GetLastError());
+            result->status = CG_STATUS_INTERNAL_ERROR;
+            goto cleanup;
+        }
+        if (!cg_capture_reserve_slots(stdout_capture, stderr_capture)) {
+            cg_set_error(result, ERROR_NOT_ENOUGH_QUOTA);
+            result->status = CG_STATUS_INTERNAL_ERROR;
+            goto cleanup;
+        }
     }
     if (!cg_build_command_line(options, &command_line)) {
         cg_set_error(result, ERROR_BUFFER_OVERFLOW);
@@ -1012,10 +1503,10 @@ static int cg_windows_run_internal(
     }
 
     stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
-    stdout_handle = options->capture_output ? stdout_capture.handle
-                                            : GetStdHandle(STD_OUTPUT_HANDLE);
-    stderr_handle = options->capture_output ? stderr_capture.handle
-                                            : GetStdHandle(STD_ERROR_HANDLE);
+    stdout_handle = options->capture_output ? stdout_capture->write_handle
+                                             : GetStdHandle(STD_OUTPUT_HANDLE);
+    stderr_handle = options->capture_output ? stderr_capture->write_handle
+                                             : GetStdHandle(STD_ERROR_HANDLE);
     if (!cg_duplicate_child_handle(stdin_handle, &child_stdin_handle,
                                    &last_error) ||
         !cg_duplicate_child_handle(stdout_handle, &child_stdout_handle,
@@ -1025,6 +1516,23 @@ static int cg_windows_run_internal(
         cg_set_error(result, last_error);
         result->status = CG_STATUS_START_FAILED;
         goto cleanup;
+    }
+    if (options->capture_output) {
+        int write_close_ok = 1;
+
+        if (!cg_capture_close_write(stdout_capture, &last_error)) {
+            write_close_ok = 0;
+        }
+        if (!cg_capture_close_write(stderr_capture, &last_error)) {
+            write_close_ok = 0;
+        }
+        if (!write_close_ok) {
+            cg_set_error(result, last_error);
+            result->status = CG_STATUS_START_FAILED;
+            goto cleanup;
+        }
+        stdout_handle = NULL;
+        stderr_handle = NULL;
     }
     startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup_info.StartupInfo.hStdInput = child_stdin_handle;
@@ -1103,45 +1611,74 @@ static int cg_windows_run_internal(
     thread = process_info.hThread;
     result->process_id = process_info.dwProcessId;
 
-    if (!AssignProcessToJobObject(job, process)) {
+    if (!hooks->assign_process_to_job(job, process)) {
         last_error = GetLastError();
         result->status = CG_STATUS_CONTAINMENT_FAILED;
         cg_set_error(result, last_error);
-        result->cleanup_ok = 0;
-        TerminateProcess(process, 125U);
-        WaitForSingleObject(process, CG_TIMEOUT_GRACE_MS);
+        (void)cg_terminate_unassigned_process(process, result);
         goto cleanup;
     }
     job_assigned = 1;
+    if (options->capture_output) {
+        if (!cg_capture_start(stdout_capture, output_failure_event,
+                              hooks->read_file, &last_error) ||
+            !cg_capture_start(stderr_capture, output_failure_event,
+                              hooks->read_file, &last_error)) {
+            cg_set_error(result, last_error);
+            result->status = CG_STATUS_INTERNAL_ERROR;
+            result->cleanup_ok = 0;
+            terminate_attempted = 1;
+            (void)cg_terminate_job(job, process, result, 125U);
+            goto cleanup;
+        }
+    }
     if (ResumeThread(thread) == (DWORD)-1) {
         cg_set_error(result, GetLastError());
         result->status = CG_STATUS_INTERNAL_ERROR;
         result->cleanup_ok = 0;
-        TerminateJobObject(job, 125U);
-        WaitForSingleObject(process, CG_TIMEOUT_GRACE_MS);
+        (void)cg_terminate_job(job, process, result, 125U);
         goto cleanup;
     }
+    capture_output_available = options->capture_output;
 
     wait_result = cg_wait_for_process(
         process, completion_port, job, cpu_time_limit_enabled
             ? cpu_time_limit_ticks : 0U,
-        poll_completion_port, (DWORD)options->timeout_ms, &resource_flags,
-        &last_error);
+        poll_completion_port, output_failure_event,
+        (DWORD)options->timeout_ms, &resource_flags, &last_error);
     if (wait_result != WAIT_FAILED && completion_port != NULL &&
         !cg_drain_resource_notifications(completion_port, &resource_flags,
-                                         &last_error)) {
+                                          &last_error)) {
+        wait_result = WAIT_FAILED;
+    }
+    if (wait_result != WAIT_FAILED &&
+        (!cg_check_cpu_job_signal(job, cpu_time_limit_enabled,
+                                  &resource_flags, &last_error) ||
+         !cg_check_cpu_accounting(job, cpu_time_limit_enabled
+                                           ? cpu_time_limit_ticks
+                                           : 0U,
+                                  &resource_flags, &last_error))) {
         wait_result = WAIT_FAILED;
     }
     result->resource_limit_hit = resource_flags != 0U;
     result->resource_limit_kind = cg_resource_limit_kind(resource_flags);
+    if (wait_result == WAIT_TIMEOUT) {
+        DWORD boundary_wait = WaitForSingleObject(process, 0);
+        if (boundary_wait == WAIT_OBJECT_0) {
+            wait_result = WAIT_OBJECT_0;
+        } else if (boundary_wait == WAIT_FAILED) {
+            last_error = GetLastError();
+            wait_result = WAIT_FAILED;
+        }
+    }
     if (wait_result == CG_WAIT_RESOURCE ||
-        (wait_result == WAIT_TIMEOUT && resource_flags != 0U)) {
+        ((wait_result == WAIT_TIMEOUT || wait_result == CG_WAIT_OUTPUT) &&
+         resource_flags != 0U)) {
         result->status = CG_STATUS_RESOURCE_LIMIT;
         terminate_attempted = 1;
         (void)cg_terminate_job(job, process, result,
                                CG_RESOURCE_TERMINATION_CODE);
-    } else if (wait_result == WAIT_TIMEOUT &&
-               WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
+    } else if (wait_result == WAIT_TIMEOUT) {
         result->timed_out = 1;
         result->status = CG_STATUS_TIMEOUT;
         terminate_attempted = 1;
@@ -1155,6 +1692,22 @@ static int cg_windows_run_internal(
         } else {
             result->status = CG_STATUS_EXITED;
         }
+    } else if (wait_result == CG_WAIT_OUTPUT) {
+        LONG stdout_error = InterlockedCompareExchange(
+            &stdout_capture->read_error, 0, 0);
+        LONG stderr_error = InterlockedCompareExchange(
+            &stderr_capture->read_error, 0, 0);
+
+        last_error = stdout_error != (LONG)ERROR_SUCCESS
+                         ? (DWORD)stdout_error
+                         : (DWORD)stderr_error;
+        if (last_error == ERROR_SUCCESS) {
+            last_error = ERROR_READ_FAULT;
+        }
+        cg_set_error(result, last_error);
+        result->status = CG_STATUS_INTERNAL_ERROR;
+        terminate_attempted = 1;
+        (void)cg_terminate_job(job, process, result, 125U);
     } else {
         cg_set_error(result, last_error);
         result->status = CG_STATUS_INTERNAL_ERROR;
@@ -1181,40 +1734,6 @@ static int cg_windows_run_internal(
         cg_collect_process_metrics(process, &result->metrics);
     }
 
-    if (options->capture_output) {
-        DWORD output_error_code;
-        if (!cg_read_capture(&stdout_capture, &result->stdout_utf8,
-                             &result->stdout_size, &result->output_truncated,
-                             &output_error_code)) {
-            output_error = 1;
-            last_error = output_error_code;
-        }
-        {
-            int stderr_truncated;
-            if (!cg_read_capture(&stderr_capture, &result->stderr_utf8,
-                                 &result->stderr_size, &stderr_truncated,
-                                 &output_error_code)) {
-                output_error = 1;
-                last_error = output_error_code;
-            }
-            if (stderr_truncated) {
-                result->output_truncated = 1;
-            }
-        }
-        if (result->stdout_utf8 != NULL) {
-            cg_normalize_newlines(result->stdout_utf8, &result->stdout_size);
-        }
-        if (result->stderr_utf8 != NULL) {
-            cg_normalize_newlines(result->stderr_utf8, &result->stderr_size);
-        }
-        if (output_error) {
-            cg_set_error(result, last_error);
-            if (result->status == CG_STATUS_EXITED) {
-                result->status = CG_STATUS_INTERNAL_ERROR;
-            }
-        }
-    }
-
 cleanup:
     result->duration_ms = cg_now_ms() - started_at;
     if (process_started && process != NULL &&
@@ -1233,7 +1752,8 @@ cleanup:
         result->status = CG_STATUS_CONTAINMENT_FAILED;
     }
     if (job_metrics != NULL && job_assigned && job != NULL) {
-        cg_collect_job_metrics(job, job_metrics, query_job_information);
+        cg_collect_job_metrics(job, job_metrics,
+                               hooks->query_job_information);
     }
     if (attribute_list_initialized) {
         DeleteProcThreadAttributeList(attribute_list);
@@ -1244,19 +1764,124 @@ cleanup:
     cg_close_child_handle(stdin_handle, child_stdin_handle);
     cg_close_child_handle(stdout_handle, child_stdout_handle);
     cg_close_child_handle(stderr_handle, child_stderr_handle);
+    if (stdout_capture != NULL &&
+        !cg_capture_close_write(stdout_capture, &last_error) &&
+        capture_output_available) {
+        output_error = 1;
+    }
+    if (stderr_capture != NULL &&
+        !cg_capture_close_write(stderr_capture, &last_error) &&
+        capture_output_available) {
+        output_error = 1;
+    }
+    if (job != NULL) {
+        DWORD job_cleanup_error = ERROR_SUCCESS;
+        if (job_assigned) {
+            DWORD empty_error = ERROR_SUCCESS;
+            if (!TerminateJobObject(job, 125U)) {
+                job_cleanup_error = GetLastError();
+                if (job_cleanup_error == ERROR_SUCCESS) {
+                    job_cleanup_error = ERROR_GEN_FAILURE;
+                }
+            }
+            if (!cg_wait_job_empty(job, CG_TIMEOUT_GRACE_MS, &empty_error) &&
+                job_cleanup_error == ERROR_SUCCESS) {
+                job_cleanup_error = empty_error;
+            }
+        }
+        if (!CloseHandle(job) && job_cleanup_error == ERROR_SUCCESS) {
+            job_cleanup_error = GetLastError();
+            if (job_cleanup_error == ERROR_SUCCESS) {
+                job_cleanup_error = ERROR_GEN_FAILURE;
+            }
+        }
+        if (job_cleanup_error != ERROR_SUCCESS) {
+            result->cleanup_ok = 0;
+            last_error = job_cleanup_error;
+            cg_set_error(result, job_cleanup_error);
+        }
+        job = NULL;
+    }
+    {
+        DWORD join_error = ERROR_SUCCESS;
+        if (!cg_capture_join(stdout_capture, hooks->wait_capture_thread,
+                             hooks->cancel_synchronous_io,
+                             hooks->capture_cancel_grace_ms, &join_error)) {
+            output_error = capture_output_available;
+            result->cleanup_ok = 0;
+            last_error = join_error;
+        } else if (join_error != ERROR_SUCCESS && capture_output_available) {
+            output_error = 1;
+            last_error = join_error;
+        }
+        join_error = ERROR_SUCCESS;
+        if (!cg_capture_join(stderr_capture, hooks->wait_capture_thread,
+                             hooks->cancel_synchronous_io,
+                             hooks->capture_cancel_grace_ms, &join_error)) {
+            output_error = capture_output_available;
+            result->cleanup_ok = 0;
+            last_error = join_error;
+        } else if (join_error != ERROR_SUCCESS && capture_output_available) {
+            output_error = 1;
+            last_error = join_error;
+        }
+    }
+    if (result->status == CG_STATUS_RESOURCE_LIMIT && !result->cleanup_ok) {
+        result->status = CG_STATUS_CONTAINMENT_FAILED;
+    }
+    if (capture_output_available) {
+        DWORD output_error_code = ERROR_SUCCESS;
+
+        result->output_truncated =
+            (stdout_capture != NULL && stdout_capture->thread_joined &&
+             InterlockedCompareExchange(&stdout_capture->truncated, 0, 0) != 0) ||
+            (stderr_capture != NULL && stderr_capture->thread_joined &&
+             InterlockedCompareExchange(&stderr_capture->truncated, 0, 0) != 0);
+        if (stdout_capture != NULL && stdout_capture->thread_joined &&
+            !cg_capture_take(stdout_capture, &result->stdout_utf8,
+                             &result->stdout_size, &output_error_code)) {
+            output_error = 1;
+            last_error = output_error_code;
+        }
+        if (stderr_capture != NULL && stderr_capture->thread_joined &&
+            !cg_capture_take(stderr_capture, &result->stderr_utf8,
+                             &result->stderr_size, &output_error_code)) {
+            output_error = 1;
+            last_error = output_error_code;
+        }
+        if (result->stdout_utf8 != NULL) {
+            cg_normalize_newlines(result->stdout_utf8, &result->stdout_size);
+        }
+        if (result->stderr_utf8 != NULL) {
+            cg_normalize_newlines(result->stderr_utf8, &result->stderr_size);
+        }
+        if (output_error) {
+            cg_set_error(result, last_error);
+            if (result->status == CG_STATUS_EXITED) {
+                result->status = CG_STATUS_INTERNAL_ERROR;
+            }
+        }
+    }
     if (thread != NULL) {
         CloseHandle(thread);
     }
     if (process != NULL) {
         CloseHandle(process);
     }
-    cg_capture_close(&stdout_capture);
-    cg_capture_close(&stderr_capture);
+    /* An unconfirmed reader retains heap-owned state and all handles it can
+       still access. This bounded quarantine is preferable to a UAF. */
+    if (!cg_capture_close(stdout_capture)) {
+        cg_capture_quarantine(stdout_capture);
+    }
+    if (!cg_capture_close(stderr_capture)) {
+        cg_capture_quarantine(stderr_capture);
+    }
+    cg_capture_reap_quarantined();
     if (completion_port != NULL) {
         CloseHandle(completion_port);
     }
-    if (job != NULL) {
-        CloseHandle(job);
+    if (output_failure_event != NULL) {
+        CloseHandle(output_failure_event);
     }
     cg_builder_free(&command_line);
     return 0;
@@ -1265,8 +1890,8 @@ cleanup:
 int cg_windows_run(const cg_run_options *options, cg_run_result *result,
                    cg_job_metrics *job_metrics)
 {
-    return cg_windows_run_internal(options, result, job_metrics,
-                                   cg_query_job_information);
+    cg_windows_test_hooks hooks = cg_default_windows_hooks();
+    return cg_windows_run_internal(options, result, job_metrics, &hooks);
 }
 
 #ifdef COREGUARD_TEST_HOOKS
@@ -1276,10 +1901,54 @@ int cg_windows_run_with_job_metrics_query_hook(
     cg_job_metrics *job_metrics,
     cg_query_job_information_fn query_job_information)
 {
+    cg_windows_test_hooks hooks = cg_default_windows_hooks();
+
     if (query_job_information == NULL) {
         return -1;
     }
-    return cg_windows_run_internal(options, result, job_metrics,
-                                   query_job_information);
+    hooks.query_job_information = query_job_information;
+    return cg_windows_run_internal(options, result, job_metrics, &hooks);
+}
+
+int cg_windows_run_with_test_hooks(
+    const cg_run_options *options,
+    cg_run_result *result,
+    cg_job_metrics *job_metrics,
+    const cg_windows_test_hooks *test_hooks)
+{
+    cg_windows_test_hooks hooks = cg_default_windows_hooks();
+
+    if (test_hooks == NULL) {
+        return -1;
+    }
+    if (test_hooks->query_job_information != NULL) {
+        hooks.query_job_information = test_hooks->query_job_information;
+    }
+    if (test_hooks->read_file != NULL) {
+        hooks.read_file = test_hooks->read_file;
+    }
+    if (test_hooks->assign_process_to_job != NULL) {
+        hooks.assign_process_to_job = test_hooks->assign_process_to_job;
+    }
+    if (test_hooks->wait_capture_thread != NULL) {
+        hooks.wait_capture_thread = test_hooks->wait_capture_thread;
+    }
+    if (test_hooks->cancel_synchronous_io != NULL) {
+        hooks.cancel_synchronous_io = test_hooks->cancel_synchronous_io;
+    }
+    if (test_hooks->capture_cancel_grace_ms != 0U) {
+        hooks.capture_cancel_grace_ms = test_hooks->capture_cancel_grace_ms;
+    }
+    return cg_windows_run_internal(options, result, job_metrics, &hooks);
+}
+
+LONG cg_windows_test_quarantined_capture_count(void)
+{
+    return InterlockedCompareExchange(&cg_quarantined_capture_count, 0, 0);
+}
+
+LONG cg_windows_test_capture_slot_limit(void)
+{
+    return CG_CAPTURE_QUARANTINE_LIMIT;
 }
 #endif
