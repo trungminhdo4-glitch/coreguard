@@ -183,7 +183,5 @@ and deferred signing, SBOM, and package-manager decisions.
 
 ## License
 
-Coreguard is source-available, not open source, under the PolyForm Strict License 1.0.0.
-The complete license text is in `LICENSE`. Commercial licensing
-remains separately available from the copyright holder. No MIT, Apache, GPL,
-or public-domain license is granted by this repository.
+Coreguard is licensed under the MIT License. See [`LICENSE`](LICENSE) for the
+complete terms.
