@@ -891,7 +891,7 @@ def main() -> int:
             "generator": args.generator or "CMake default generator",
             "artifact": archive_copy.name,
             "sha256": digest,
-            "license": "PolyForm Strict License 1.0.0",
+            "license": "MIT License",
             "signed": False,
             "published": False,
             "architecture": "x64",
@@ -918,7 +918,7 @@ def main() -> int:
                 "gates": gates,
                 "all_gates_pass_or_not_applicable": all_gates_pass,
             },
-            "license_status": "POLYFORM_STRICT_1_0_0_OWNER_AUTHORIZED",
+            "license_status": "MIT_LICENSE",
             "version_status": (
                 "OWNER_AUTHORIZED_RELEASE_VERSION_0.1.0"
                 if args.version == "0.1.0"
@@ -934,7 +934,7 @@ def main() -> int:
 
         report = {
             "classification": (
-                "COREGUARD_V0_1_0_POLYFORM_STRICT_RC_PROVEN"
+                "COREGUARD_V0_1_0_MIT_RC_PROVEN"
                 if args.version == "0.1.0"
                 else "COREGUARD_VERSIONED_RC_PROVEN"
                 if args.version
