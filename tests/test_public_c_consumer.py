@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -154,6 +155,85 @@ class PublicConsumerTests(unittest.TestCase):
             self.assert_runs(executable)
         finally:
             temporary.cleanup()
+
+    def test_bounded_pipe_capture_native_consumer(self) -> None:
+        temporary, executable, completed = self.compile_consumer(
+            CONSUMERS / "bounded_output" / "main.c",
+            PUBLIC_HEADER,
+        )
+        try:
+            self.assert_compile_success(self, completed)
+            capture_temp = executable.parent / "capture-temp"
+            capture_temp.mkdir()
+            environment = os.environ.copy()
+            environment["TEMP"] = str(capture_temp)
+            environment["TMP"] = str(capture_temp)
+            process = subprocess.Popen(
+                [str(executable)],
+                cwd=executable.parent,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            deadline = time.monotonic() + 30
+            max_temp_file_size = 0
+            observed_temp_files: set[pathlib.Path] = set()
+            while process.poll() is None and time.monotonic() < deadline:
+                for candidate in capture_temp.rglob("*"):
+                    if candidate.is_file():
+                        observed_temp_files.add(candidate)
+                        max_temp_file_size = max(
+                            max_temp_file_size,
+                            candidate.stat().st_size,
+                        )
+                time.sleep(0.01)
+            if process.poll() is None:
+                process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(
+                process.returncode,
+                0,
+                stdout + stderr,
+            )
+            self.assertEqual(observed_temp_files, set())
+            self.assertEqual(max_temp_file_size, 0)
+            self.assertEqual(list(capture_temp.rglob("*")), [])
+        finally:
+            temporary.cleanup()
+
+    def test_private_capture_failure_hooks(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="coreguard-capture-hooks-", dir=BUILD
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            executable = root / "capture-hooks.exe"
+            command = (
+                f'call "{VCVARS}" && '
+                "cl /nologo /W4 /WX /analyze /wd28301 /MD /std:c11 /TC "
+                "/DCOREGUARD_TEST_HOOKS /D_CRT_SECURE_NO_WARNINGS "
+                "/DUNICODE /D_UNICODE "
+                f'/I"{ROOT / "include"}" /I"{ROOT / "src"}" '
+                f'"{ROOT / "tests" / "native_capture_failures.c"}" '
+                f'"{ROOT / "src" / "process.c"}" '
+                f'"{ROOT / "src" / "platform" / "windows_process.c"}" '
+                f'/Fe:"{executable}" /link psapi.lib'
+            )
+            compiled = subprocess.run(
+                command,
+                cwd=root,
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+            self.assert_compile_success(self, compiled)
+            self.assert_runs(executable)
 
     def test_cpp_and_header_self_containment(self) -> None:
         cases = (
