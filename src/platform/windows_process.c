@@ -1381,7 +1381,6 @@ static int cg_windows_run_internal(
     uint64_t started_at = cg_now_ms();
     int process_started = 0;
     int job_assigned = 0;
-    int terminate_attempted = 0;
     int output_error = 0;
     int capture_output_available = 0;
     uint32_t resource_flags = 0;
@@ -1627,7 +1626,6 @@ static int cg_windows_run_internal(
             cg_set_error(result, last_error);
             result->status = CG_STATUS_INTERNAL_ERROR;
             result->cleanup_ok = 0;
-            terminate_attempted = 1;
             (void)cg_terminate_job(job, process, result, 125U);
             goto cleanup;
         }
@@ -1675,18 +1673,15 @@ static int cg_windows_run_internal(
         ((wait_result == WAIT_TIMEOUT || wait_result == CG_WAIT_OUTPUT) &&
          resource_flags != 0U)) {
         result->status = CG_STATUS_RESOURCE_LIMIT;
-        terminate_attempted = 1;
         (void)cg_terminate_job(job, process, result,
                                CG_RESOURCE_TERMINATION_CODE);
     } else if (wait_result == WAIT_TIMEOUT) {
         result->timed_out = 1;
         result->status = CG_STATUS_TIMEOUT;
-        terminate_attempted = 1;
         (void)cg_terminate_job(job, process, result, 124U);
     } else if (wait_result == WAIT_OBJECT_0) {
         if (resource_flags != 0U) {
             result->status = CG_STATUS_RESOURCE_LIMIT;
-            terminate_attempted = 1;
             (void)cg_terminate_job(job, process, result,
                                    CG_RESOURCE_TERMINATION_CODE);
         } else {
@@ -1706,12 +1701,10 @@ static int cg_windows_run_internal(
         }
         cg_set_error(result, last_error);
         result->status = CG_STATUS_INTERNAL_ERROR;
-        terminate_attempted = 1;
         (void)cg_terminate_job(job, process, result, 125U);
     } else {
         cg_set_error(result, last_error);
         result->status = CG_STATUS_INTERNAL_ERROR;
-        terminate_attempted = 1;
         if (job_assigned) {
             (void)cg_terminate_job(job, process, result, 125U);
         }
@@ -1736,13 +1729,11 @@ static int cg_windows_run_internal(
 
 cleanup:
     result->duration_ms = cg_now_ms() - started_at;
-    if (process_started && process != NULL &&
-        result->status != CG_STATUS_TIMEOUT && terminate_attempted == 0) {
-        /* A normal exit leaves no active job members. */
-        if (job_assigned && !cg_wait_job_empty(job, 100U, NULL)) {
-            result->cleanup_ok = 0;
-        }
-    }
+    /* cleanup_ok reports the verified final state below (forced reap via
+       TerminateJobObject plus an emptiness wait): a tree that merely needs
+       longer than a grace period to drain is still fully reaped, so a
+       separate early drain poll here would turn ordinary slow-draining
+       "exited" runs into false cleanup failures. */
     if (process != NULL && result->status == CG_STATUS_TIMEOUT &&
         !result->cleanup_ok) {
         /* The close-on-close job flag is the final kernel backstop. */
