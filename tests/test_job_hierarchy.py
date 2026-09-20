@@ -106,6 +106,55 @@ class GatePredicateTests(unittest.TestCase):
         self.assertFalse(should_skip_slow_box(None))
 
 
+# Functional containment is budget-independent: --nested-hold keeps the tree
+# alive, so any timeout below the 30 s harness cap deterministically exercises
+# classification plus cleanup. 10000 ms stays above the worst measured slow-box
+# initialization (~6 s AV/reputation interception plus ~0.4 s spawn) while the
+# 300 ms product budget keeps its own capability-gated timing test below.
+FUNCTIONAL_NESTED_TIMEOUT_MS = 10000
+
+
+def nested_hold_child_pids(target: dict) -> list[int]:
+    """Fail-closed fixture gate for --nested-hold reports.
+
+    Returns the initialized child-job PIDs. Raises AssertionError when the
+    report misses fixtures or the tree was not fully initialized, so a
+    partially spawned tree can never vacuously pass containment checks.
+    """
+    child_pids = target.get("child_job_pids")
+    if not isinstance(child_pids, list) or not child_pids:
+        raise AssertionError(f"nested-hold produced no child-job PIDs: {target!r}")
+    expected = target.get("expected_pids")
+    if not isinstance(expected, list) or not expected:
+        raise AssertionError(f"nested-hold produced no expected PIDs: {target!r}")
+    if set(expected) != set(child_pids):
+        raise AssertionError(
+            "nested-hold tree incompletely initialized: "
+            f"expected={expected!r} child_job_pids={child_pids!r}"
+        )
+    return child_pids
+
+
+class NestedHoldFixtureTests(unittest.TestCase):
+    def test_valid_tree_returns_child_pids(self):
+        target = {"child_job_pids": [101, 102, 103], "expected_pids": [103, 101, 102]}
+        self.assertEqual(nested_hold_child_pids(target), [101, 102, 103])
+
+    def test_missing_child_pids_fails_closed(self):
+        with self.assertRaises(AssertionError):
+            nested_hold_child_pids({"expected_pids": [101]})
+
+    def test_empty_pid_list_fails_closed(self):
+        with self.assertRaises(AssertionError):
+            nested_hold_child_pids({"child_job_pids": [], "expected_pids": []})
+
+    def test_incomplete_tree_fails_closed(self):
+        with self.assertRaises(AssertionError):
+            nested_hold_child_pids(
+                {"child_job_pids": [101], "expected_pids": [101, 102, 103]}
+            )
+
+
 class JobHierarchyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -270,6 +319,24 @@ class JobHierarchyTests(unittest.TestCase):
         self.assertEqual(payload["job_metrics"]["total_processes"], 3)
 
     def test_nested_timeout_terminates_entire_tree(self) -> None:
+        # Functional containment proof without any host-capability gate.
+        payload, target, _ = self.run_coreguard(
+            ["--nested-hold", "target.json"],
+            ["--timeout-ms", str(FUNCTIONAL_NESTED_TIMEOUT_MS)],
+        )
+        self.assertEqual(payload["status"], "timeout")
+        self.assertTrue(payload["timed_out"])
+        child_pids = nested_hold_child_pids(target)
+        self.assertTrue(payload["cleanup_ok"])
+        for pid in child_pids:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and process_is_active(pid):
+                time.sleep(0.02)
+            self.assertFalse(
+                process_is_active(pid), f"nested PID survived cleanup: {pid}"
+            )
+
+    def test_nested_timeout_terminates_entire_tree_within_300ms_budget(self) -> None:
         latency = nested_spawn_latency_ms(self.run_coreguard)
         if should_skip_slow_box(latency):
             raise unittest.SkipTest(
@@ -283,7 +350,7 @@ class JobHierarchyTests(unittest.TestCase):
         self.assertEqual(payload["status"], "timeout")
         self.assertTrue(payload["timed_out"])
         self.assertTrue(payload["cleanup_ok"])
-        for pid in target["child_job_pids"]:
+        for pid in nested_hold_child_pids(target):
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline and process_is_active(pid):
                 time.sleep(0.02)
