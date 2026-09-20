@@ -65,6 +65,10 @@ $vsDevCmd = Join-Path $vsInstall "Common7\Tools\VsDevCmd.bat"
 if (-not (Test-Path -LiteralPath $vsDevCmd)) {
     throw "VsDevCmd.bat was not found: $vsDevCmd"
 }
+$vcvars = Join-Path $vsInstall "VC\Auxiliary\Build\vcvars64.bat"
+if (-not (Test-Path -LiteralPath $vcvars)) {
+    throw "vcvars64.bat was not found: $vcvars"
+}
 
 function Invoke-DeveloperCommand {
     param([Parameter(Mandatory = $true)][string]$CommandLine)
@@ -89,6 +93,7 @@ function Invoke-PythonGate {
 }
 
 $developerCommand = @(
+    ('set "COREGUARD_VCVARS=' + $vcvars + '"'),
     ('call "' + $vsDevCmd + '" -arch=x64 -host_arch=x64'),
     ('cmake -S "' + $root + '" -B "' + $buildPath + '" -A x64 -DCOREGUARD_VERSION=' + $Version),
     ('cmake --build "' + $buildPath + '" --config Release --parallel --verbose'),
