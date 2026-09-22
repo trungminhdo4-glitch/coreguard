@@ -349,7 +349,7 @@ static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
         }
 
         remaining = deadline - now;
-        wait_ms = remaining > CG_RESOURCE_POLL_MS
+        wait_ms = poll_completion_port && remaining > CG_RESOURCE_POLL_MS
                       ? CG_RESOURCE_POLL_MS
                       : (DWORD)remaining;
         if (wait_ms == 0U) {
@@ -1424,7 +1424,7 @@ static int cg_windows_run_internal(
     cpu_time_limit_enabled = cg_cpu_time_limit_enabled(resource_limits);
     active_process_limit_enabled =
         cg_active_process_limit_enabled(resource_limits);
-    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled;
+    poll_completion_port = 0;
 
     job = CreateJobObjectW(NULL, NULL);
     if (job == NULL) {
@@ -1476,6 +1476,9 @@ static int cg_windows_run_internal(
         result->status = CG_STATUS_CONTAINMENT_FAILED;
         goto cleanup;
     }
+    poll_completion_port =
+        memory_limit_enabled ||
+        (cpu_time_limit_enabled && completion_port != NULL);
     if (options->capture_output) {
         if (!cg_capture_create(&stdout_capture, &last_error) ||
             !cg_capture_create(&stderr_capture, &last_error)) {

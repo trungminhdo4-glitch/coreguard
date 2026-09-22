@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import pathlib
@@ -10,6 +11,76 @@ import statistics
 import subprocess
 import sys
 import time
+from ctypes import wintypes
+
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+class FileTime(ctypes.Structure):
+    _fields_ = (("low", wintypes.DWORD), ("high", wintypes.DWORD))
+
+
+def filetime_ticks(value: FileTime) -> int:
+    return (int(value.high) << 32) | int(value.low)
+
+
+def run_with_process_cpu(
+    command: list[str],
+) -> tuple[subprocess.CompletedProcess[str], float]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    )
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+    )
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, process.pid
+    )
+    if not handle:
+        process.kill()
+        process.communicate()
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        stdout, stderr = process.communicate()
+        creation = FileTime()
+        exit_time = FileTime()
+        kernel = FileTime()
+        user = FileTime()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+    completed = subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout,
+        stderr,
+    )
+    cpu_ms = (filetime_ticks(kernel) + filetime_ticks(user)) / 10_000.0
+    return completed, cpu_ms
 
 
 def median_ms(samples: list[float]) -> float:
@@ -26,7 +97,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=pathlib.Path, required=True)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--idle-wait-iterations", type=int, default=10)
+    parser.add_argument("--idle-wait-seconds", type=float, default=1.0)
     args = parser.parse_args()
+    if args.iterations < 1:
+        parser.error("--iterations must be at least 1")
+    if args.idle_wait_iterations < 1:
+        parser.error("--idle-wait-iterations must be at least 1")
+    if not math.isfinite(args.idle_wait_seconds) or not (
+        0 < args.idle_wait_seconds <= 4.0
+    ):
+        parser.error("--idle-wait-seconds must be finite and in (0, 4]")
     command = [sys.executable, "-c", "pass"]
     direct = []
     coreguard_no_metrics = []
@@ -35,6 +116,7 @@ def main() -> int:
     coreguard_cpu = []
     coreguard_active = []
     coreguard_cpu_active = []
+    coreguard_cpu_idle = []
     for _ in range(args.iterations):
         started = time.perf_counter()
         completed = subprocess.run(
@@ -158,6 +240,29 @@ def main() -> int:
         if payload["status"] != "exited" or completed.returncode != 0:
             raise RuntimeError("coreguard CPU-plus-active baseline run failed: %r" % payload)
         coreguard_cpu_active.append((time.perf_counter() - started) * 1000)
+    idle_command = [
+        sys.executable,
+        "-c",
+        "import time; time.sleep(%r)" % args.idle_wait_seconds,
+    ]
+    for _ in range(args.idle_wait_iterations):
+        completed, process_cpu_ms = run_with_process_cpu(
+            [
+                str(args.exe),
+                "run",
+                "--json",
+                "--timeout-ms",
+                "5000",
+                "--cpu-time-limit-ms",
+                "5000",
+                "--",
+                *idle_command,
+            ]
+        )
+        payload = json.loads(completed.stdout)
+        if payload["status"] != "exited" or completed.returncode != 0:
+            raise RuntimeError("coreguard CPU-only idle run failed: %r" % payload)
+        coreguard_cpu_idle.append(process_cpu_ms)
     direct_median = median_ms(direct)
     coreguard_no_metrics_median = median_ms(coreguard_no_metrics)
     coreguard_median = median_ms(coreguard)
@@ -208,6 +313,22 @@ def main() -> int:
             "p95_ms": round(percentile_ms(coreguard_cpu_active, 0.95), 3),
             "min_ms": round(min(coreguard_cpu_active), 3),
             "max_ms": round(max(coreguard_cpu_active), 3),
+        },
+        "coreguard_cpu_only_idle_wait": {
+            "iterations": args.idle_wait_iterations,
+            "sleep_seconds": args.idle_wait_seconds,
+            "median_process_cpu_ms": round(
+                statistics.median(coreguard_cpu_idle), 3
+            ),
+            "mean_process_cpu_ms": round(statistics.mean(coreguard_cpu_idle), 3),
+            "p95_process_cpu_ms": round(
+                percentile_ms(coreguard_cpu_idle, 0.95), 3
+            ),
+            "min_process_cpu_ms": round(min(coreguard_cpu_idle), 3),
+            "max_process_cpu_ms": round(max(coreguard_cpu_idle), 3),
+            "samples_process_cpu_ms": [
+                round(value, 3) for value in coreguard_cpu_idle
+            ],
         },
         "median_overhead_ms": round(coreguard_median - direct_median, 3),
         "median_overhead_percent": round((coreguard_median / direct_median - 1) * 100, 2),
