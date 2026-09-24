@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -21,6 +23,10 @@ ENV_CHILD = (
     "sort_keys=True))"
 )
 CWD_CHILD = "import os; print(os.getcwd())"
+STDIN_DIGEST_CHILD = (
+    "import sys, hashlib; d = sys.stdin.buffer.read(); "
+    "print(len(d), hashlib.sha256(d).hexdigest())"
+)
 
 
 class ExecContextTests(unittest.TestCase):
@@ -53,6 +59,7 @@ class ExecContextTests(unittest.TestCase):
         json_mode: bool = True,
         env: dict[str, str] | None = None,
         cwd: pathlib.Path | None = None,
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         runner = [str(self.exe), "run", "--timeout-ms", "10000"]
         if json_mode:
@@ -63,6 +70,7 @@ class ExecContextTests(unittest.TestCase):
             runner,
             cwd=cwd or ROOT,
             env=env,
+            input=input_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -78,8 +86,16 @@ class ExecContextTests(unittest.TestCase):
         *,
         env: dict[str, str] | None = None,
         cwd: pathlib.Path | None = None,
+        input_text: str | None = None,
     ) -> tuple[dict, subprocess.CompletedProcess[str]]:
-        completed = self.run_raw(options, command, json_mode=True, env=env, cwd=cwd)
+        completed = self.run_raw(
+            options,
+            command,
+            json_mode=True,
+            env=env,
+            cwd=cwd,
+            input_text=input_text,
+        )
         self.assertEqual(completed.stderr, "", completed.stderr)
         return json.loads(completed.stdout), completed
 
@@ -278,6 +294,72 @@ class ExecContextTests(unittest.TestCase):
                 pathlib.Path(temporary).resolve(),
             )
             self.assertEqual(observed["env"], {"ONLY": "one"})
+
+    def test_stdin_file_is_delivered_exactly(self) -> None:
+        payload = bytes(range(256)) * 16
+        with tempfile.TemporaryDirectory(prefix="cg-stdin-", dir=BUILD) as temporary:
+            path = pathlib.Path(temporary) / "payload.bin"
+            path.write_bytes(payload)
+            result, completed = self.run_json(
+                ["--stdin-file", str(path)],
+                [sys.executable, "-c", STDIN_DIGEST_CHILD],
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(result["status"], "exited", result)
+        observed = result["stdout"].split()
+        self.assertEqual(observed[0], str(len(payload)))
+        self.assertEqual(observed[1], hashlib.sha256(payload).hexdigest())
+
+    def test_stdin_max_payload_without_reader_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="cg-stdin-max-", dir=BUILD
+        ) as temporary:
+            path = pathlib.Path(temporary) / "max.bin"
+            path.write_bytes(b"s" * (64 * 1024))
+            started = time.monotonic()
+            result, completed = self.run_json(
+                ["--stdin-file", str(path)],
+                ["cmd.exe", "/d", "/c", "exit 0"],
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(result["status"], "exited", result)
+        self.assertLess(elapsed, 10.0)
+
+    def test_stdin_default_inherits_caller_stdin(self) -> None:
+        result, completed = self.run_json(
+            [],
+            [
+                sys.executable,
+                "-c",
+                "import sys; print(repr(sys.stdin.buffer.read()))",
+            ],
+            input_text="inherit-me\n",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(result["status"], "exited", result)
+        self.assertIn("inherit-me", result["stdout"])
+
+    def test_stdin_file_rejects_invalid_files(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="cg-stdin-bad-", dir=BUILD
+        ) as temporary:
+            base = pathlib.Path(temporary)
+            (base / "empty.bin").write_bytes(b"")
+            (base / "over.bin").write_bytes(b"x" * (64 * 1024 + 1))
+            for path in (
+                base / "missing.bin",
+                base / "empty.bin",
+                base / "over.bin",
+            ):
+                with self.subTest(path=path.name):
+                    completed = self.run_raw(
+                        ["--stdin-file", str(path)],
+                        [sys.executable, "-c", "pass"],
+                    )
+                    self.assertEqual(completed.returncode, 2, completed.stderr)
+                    self.assertIn("--stdin-file", completed.stderr)
+                    self.assertEqual(completed.stdout, "")
 
 
 if __name__ == "__main__":

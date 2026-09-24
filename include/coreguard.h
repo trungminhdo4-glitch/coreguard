@@ -59,6 +59,8 @@ typedef struct cg_run_options {
     (UINT32_C(1024) * UINT32_C(1024) * UINT32_C(1024))
 /* Largest accepted working_directory length in wchar_t elements. */
 #define CG_WORKDIR_MAX_CHARS UINT32_C(32767)
+/* Largest accepted stdin payload in bytes. */
+#define CG_STDIN_MAX_BYTES (UINT32_C(1024) * UINT32_C(64))
 
 typedef struct cg_exec_context {
     /* Child working directory passed as lpCurrentDirectory. NULL inherits the
@@ -80,6 +82,12 @@ typedef struct cg_exec_context {
        CG_CAPTURE_PREFIX_MAX_BYTES are rejected. Ignored unless the run
        options enable output capture. */
     size_t capture_prefix_bytes;
+    /* Optional bounded stdin payload. NULL inherits the caller's stdin; a
+       non-NULL payload must be non-empty and at most CG_STDIN_MAX_BYTES. The
+       child receives exactly these bytes on a pipe, followed by end-of-file. */
+    const void *stdin_data;
+    /* Number of bytes in stdin_data; must be zero when stdin_data is NULL. */
+    size_t stdin_size;
 } cg_exec_context;
 
 #define CG_PROCESS_METRIC_CREATION_TIME UINT32_C(1)
@@ -203,7 +211,7 @@ CG_ABI_STATIC_ASSERT(sizeof(cg_run_options) == 40,
                      "Coreguard requires default x64 options layout");
 CG_ABI_STATIC_ASSERT(offsetof(cg_run_options, resource_limits) == 32,
                      "Coreguard requires the x64 resource_limits offset");
-CG_ABI_STATIC_ASSERT(sizeof(cg_exec_context) == 32,
+CG_ABI_STATIC_ASSERT(sizeof(cg_exec_context) == 48,
                      "Coreguard requires default x64 exec context layout");
 CG_ABI_STATIC_ASSERT(CG_ABI_ALIGNOF(cg_exec_context) == 8,
                      "Coreguard requires default x64 exec context alignment");

@@ -42,6 +42,8 @@ int main(void)
     PRINT_OFFSET(cg_exec_context, environment_block);
     PRINT_OFFSET(cg_exec_context, environment_block_chars);
     PRINT_OFFSET(cg_exec_context, capture_prefix_bytes);
+    PRINT_OFFSET(cg_exec_context, stdin_data);
+    PRINT_OFFSET(cg_exec_context, stdin_size);
 
     PRINT_SIZE(cg_process_metrics);
     PRINT_ALIGN(cg_process_metrics);
