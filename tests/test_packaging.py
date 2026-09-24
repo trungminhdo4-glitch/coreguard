@@ -380,11 +380,18 @@ def run_manual_consumer(root: pathlib.Path, prefix: pathlib.Path) -> None:
     run([str(executable)], cwd=manual, timeout=60)
 
 
-def run_cli(prefix: pathlib.Path) -> dict[str, Any]:
+def run_cli(prefix: pathlib.Path, expected_version: str | None) -> dict[str, Any]:
     cli = prefix / "bin" / "coreguard.exe"
     help_result = run([str(cli), "--help"], cwd=cli.parent)
     if "Usage: coreguard run" not in help_result.stdout:
         raise PackagingProofError("installed CLI help output is missing")
+    version_result = run([str(cli), "--version"], cwd=cli.parent)
+    expected_line = f"coreguard {expected_version or 'dev'}\n"
+    if version_result.returncode != 0 or version_result.stdout != expected_line:
+        raise PackagingProofError(
+            f"installed CLI version does not match the configured version: "
+            f"{version_result.stdout!r} != {expected_line!r}"
+        )
 
     def json_payload(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
         try:
@@ -418,6 +425,15 @@ def run_cli(prefix: pathlib.Path) -> dict[str, Any]:
         or not payload.get("job_metrics", {}).get("snapshot_available")
     ):
         raise PackagingProofError(f"unexpected installed CLI result: {payload}")
+    if payload.get("contract_version") != 1 or payload.get("applied_limits") != {
+        "timeout_ms": 5000,
+        "memory_limit_bytes": 128 * 1024 * 1024,
+        "cpu_time_limit_ms": None,
+        "active_process_limit": None,
+    }:
+        raise PackagingProofError(
+            f"installed CLI result evidence is not self-describing: {payload}"
+        )
 
     timeout_run = run(
         [
@@ -815,7 +831,7 @@ def main() -> int:
         else:
             gates["version_aware_exact_find_package"] = "NOT_APPLICABLE"
             gates["version_rejection"] = "NOT_APPLICABLE"
-        cli_result = run_cli(extracted_a)
+        cli_result = run_cli(extracted_a, args.version)
         gates["packaged_cli"] = cli_result
         dependency_audit = audit_dependencies(work, extracted_a)
         gates["runtime_dependency_audit"] = "PASS"

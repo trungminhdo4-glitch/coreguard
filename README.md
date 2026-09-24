@@ -123,18 +123,81 @@ coreguard run [--json] [--timeout-ms N]
               [--memory-limit-mb N]
               [--cpu-time-limit-ms N]
               [--max-processes N] -- command args...
+coreguard --version
+coreguard --help
 ```
 
 `--json` reports the exit status, timeout/resource classification, bounded
 output, process metrics, and opt-in Job Object aggregate metrics. A normal
 child exit remains distinct from a start failure, timeout, containment failure,
-or resource-limit result.
+or resource-limit result. Without `--json` no output is captured: the child
+inherits the console handles and a one-line summary is written to stderr.
+
+`--version` prints `coreguard <version>` on one line and exits with 0. The
+version is the numeric release version of a versioned build
+(`-DCOREGUARD_VERSION=major.minor.patch`); a local development build prints
+`coreguard dev`.
+
+### CLI exit codes
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0`-`255` | The controlled process exited normally. The value is the payload exit code truncated to its low 8 bits. |
+| `123` | A job-wide resource limit was hit (see `resource_limit_kind`). |
+| `124` | The wall-clock timeout `--timeout-ms` expired. |
+| `125` | The payload could not be started or could not be contained. |
+| `126` | An internal error, including a failed capture reader. |
+| `2` | Usage error. Nothing was started. |
+
+These codes are the CLI contract. They are not part of the C API, which
+returns `cg_status` values instead.
+
+### CLI JSON result contract
+
+`--json` writes exactly one JSON object to stdout, and nothing to stderr, so a
+machine consumer can parse stdout whenever a run was attempted. Rejected
+options exit with code `2` before any execution and emit no JSON. Every object
+carries `"contract_version": 1`. That number identifies the shape of this
+object, not the product version: a new `contract_version` means a field was
+removed, renamed, or changed in meaning. Additional fields can be introduced
+without a new version, so consumers must ignore unknown keys.
+
+Fields with a fixed meaning:
+
+| Field | Meaning |
+|-------|---------|
+| `contract_version` | Shape version of this object; currently `1`. |
+| `status` | `exited`, `timeout`, `start_failed`, `containment_failed`, `internal_error`, `usage_error`, or `resource_limit`. |
+| `exit_code` | Payload exit code, or `null` when the payload did not exit on its own. |
+| `timed_out` | The wall-clock timeout expired. |
+| `resource_limit_hit`, `resource_limit_kind` | Native limit evidence and its `memory`, `cpu_time`, `active_processes`, or `unknown` cause. |
+| `duration_ms` | Milliseconds from the start of the run until the run was classified. The following tree teardown and capture-reader shutdown are not included. |
+| `process_id` | Root payload process id. |
+| `cleanup_ok` | The controlled tree was confirmed terminated. |
+| `applied_limits` | The limits this run was configured with, in native units: `timeout_ms` (always present, includes the 120000 ms default), `memory_limit_bytes`, `cpu_time_limit_ms`, `active_process_limit`. An unset limit is `null`. |
+| `metrics_scope`, `metrics` | Root-process metrics; `null` marks an unavailable native value. |
+| `job_metrics_scope`, `job_metrics` | Job Object aggregate snapshot, taken while the job handle is still open. |
+| `output_truncated` | At least one captured stream exceeded the 1 MiB raw-byte cap. |
+| `stdout_size`, `stderr_size` | Retained stream sizes in bytes, after CR/CRLF normalization; the authoritative value for a receipt. A truncated stream reports exactly the retained prefix, not the discarded volume. |
+| `stdout`, `stderr` | Captured text. Valid UTF-8 is preserved; an invalid byte is escaped as `\u00XX`, so a byte-exact length must be read from `stdout_size`/`stderr_size`, not from the string. |
+| `win32_error` | First Win32 error of the failed operation, present only when non-zero. |
+
+`applied_limits` is the authoritative record of a run's enforcement inputs. A
+receipt can bind the outcome to it instead of re-deriving defaults, unit
+conversions, or repeated-option handling from the command line. A usage error
+is rejected before execution, so an object is only emitted for a run that was
+actually attempted.
 
 ## Resource limits and metrics
 
 - `--timeout-ms` bounds wall-clock waiting for the controlled Job.
 - `--memory-limit-mb` enforces a hard, job-wide committed-memory limit.
 - `--cpu-time-limit-ms` enforces a hard, job-wide user-mode CPU-time limit.
+  CoreGuard enforces it by polling the job's user-mode accounting in bounded
+  intervals and terminating the whole job as soon as the limit is exceeded.
+  Windows' own job-time limit stays set as a kernel backstop, but Microsoft
+  documents that check as periodic, so it can fire seconds after the limit is
+  exceeded. The poll is the primary enforcement path, not the fallback.
 - `--max-processes` enforces the maximum number of simultaneously active Job
   processes; the root process counts as one.
 

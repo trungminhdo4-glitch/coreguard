@@ -968,6 +968,117 @@ class CoreguardTests(unittest.TestCase):
         self.assertEqual(payload["stdout"], "out\n")
         self.assertEqual(payload["stderr"], "err\n")
 
+    def test_json_result_declares_contract_and_applied_limits(self) -> None:
+        payload, completed = self.run_json(
+            5000,
+            ["cmd.exe", "/d", "/c", "exit 0"],
+            memory_limit_mb=128,
+            cpu_time_limit_ms=900,
+            max_processes=3,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(payload["contract_version"], 1)
+        self.assertEqual(
+            payload["applied_limits"],
+            {
+                "timeout_ms": 5000,
+                "memory_limit_bytes": 128 * 1024 * 1024,
+                "cpu_time_limit_ms": 900,
+                "active_process_limit": 3,
+            },
+        )
+
+    def test_json_applied_limits_report_unset_limits_as_null(self) -> None:
+        payload, completed = self.run_json(7000, ["cmd.exe", "/d", "/c", "exit 0"])
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            payload["applied_limits"],
+            {
+                "timeout_ms": 7000,
+                "memory_limit_bytes": None,
+                "cpu_time_limit_ms": None,
+                "active_process_limit": None,
+            },
+        )
+
+    def test_json_applied_limits_match_an_enforced_run(self) -> None:
+        payload, completed = self.run_json(
+            5000, ["cmd.exe", "/d", "/c", "exit 3"], cpu_time_limit_ms=60000
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(payload["applied_limits"]["cpu_time_limit_ms"], 60000)
+        self.assertFalse(payload["resource_limit_hit"])
+
+    def test_json_retained_stream_sizes_are_authoritative(self) -> None:
+        code = (
+            "import sys; "
+            "sys.stdout.buffer.write(b'a\\r\\nb\\n'); "
+            "sys.stderr.buffer.write(b'err')"
+        )
+        payload, completed = self.run_json(5000, [sys.executable, "-c", code])
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(payload["stdout"], "a\nb\n")
+        self.assertEqual(payload["stdout_size"], len("a\nb\n".encode("utf-8")))
+        self.assertEqual(payload["stderr"], "err")
+        self.assertEqual(payload["stderr_size"], 3)
+        self.assertFalse(payload["output_truncated"])
+
+    def test_json_retained_size_survives_truncation_and_malformed_bytes(self) -> None:
+        payload, completed = self.run_json(
+            20000,
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('x' * (1024 * 1024 + 4096))",
+            ],
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(payload["output_truncated"])
+        self.assertEqual(payload["stdout_size"], 1024 * 1024)
+        self.assertEqual(payload["stderr_size"], 0)
+
+        payload, completed = self.run_json(
+            5000,
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'\\xff\\n')",
+            ],
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(payload["stdout_size"], 2)
+        # The escaped form is wider than the retained bytes, so a consumer
+        # cannot recover the authoritative size from the JSON string alone.
+        self.assertGreater(len(payload["stdout"].encode("utf-8")), 2)
+
+    def test_cli_version_flag_is_machine_readable(self) -> None:
+        completed = subprocess.run(
+            [str(self.exe), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        line = completed.stdout.rstrip("\n")
+        self.assertEqual(line, line.strip())
+        self.assertTrue(line.startswith("coreguard "), line)
+        version = line[len("coreguard ") :]
+        self.assertTrue(version, line)
+        self.assertNotIn(" ", version)
+
+    def test_cli_separator_keeps_version_like_payload_arguments(self) -> None:
+        payload, completed = self.run_json(
+            5000,
+            [sys.executable, "-c", "import sys; print(sys.argv[1])", "--version"],
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(payload["stdout"], "--version\n")
+
+
     def test_job_metrics_aggregate_cpu_and_parallel_children(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="coreguard-job-cpu-", dir=str(ROOT / "build")

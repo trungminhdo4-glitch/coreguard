@@ -26,6 +26,8 @@ ACTIVE_HELPER = ROOT / "tests" / "helpers" / "active_process_tree.py"
 JOB_METRICS_HELPER = ROOT / "tests" / "helpers" / "job_metrics_tree.py"
 ARGV_HELPER = ROOT / "tests" / "helpers" / "argv_oracle.py"
 DEFAULT_EXE = BUILD / "coreguard.exe"
+EXPECTED_CONTRACT_VERSION = 1
+CAPTURE_LIMIT = 1024 * 1024
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
@@ -90,6 +92,7 @@ def run_coreguard(
     if not isinstance(payload, dict):
         raise VerificationFailure("coreguard JSON result is not an object")
     required = {
+        "contract_version",
         "status",
         "exit_code",
         "timed_out",
@@ -98,15 +101,49 @@ def run_coreguard(
         "duration_ms",
         "process_id",
         "cleanup_ok",
+        "applied_limits",
         "metrics_scope",
         "metrics",
         "output_truncated",
+        "stdout_size",
+        "stderr_size",
         "stdout",
         "stderr",
     }
     missing = sorted(required - payload.keys())
     if missing:
         raise VerificationFailure("coreguard JSON missing fields: %s" % missing)
+    if payload["contract_version"] != EXPECTED_CONTRACT_VERSION:
+        raise VerificationFailure(
+            "unexpected JSON contract version: %r" % payload["contract_version"]
+        )
+    applied = payload["applied_limits"]
+    if not isinstance(applied, dict) or set(applied) != {
+        "timeout_ms",
+        "memory_limit_bytes",
+        "cpu_time_limit_ms",
+        "active_process_limit",
+    }:
+        raise VerificationFailure("applied_limits fields are malformed")
+    if applied["timeout_ms"] != timeout_ms:
+        raise VerificationFailure("applied timeout does not match the request")
+    requested = {
+        "memory_limit_bytes": None
+        if memory_limit_mb is None
+        else memory_limit_mb * 1024 * 1024,
+        "cpu_time_limit_ms": cpu_time_limit_ms,
+        "active_process_limit": max_processes,
+    }
+    for name, expected in requested.items():
+        if applied[name] != expected:
+            raise VerificationFailure(
+                "applied %s is %r, expected %r" % (name, applied[name], expected)
+            )
+    for name in ("stdout_size", "stderr_size"):
+        if not isinstance(payload[name], int) or not (
+            0 <= payload[name] <= CAPTURE_LIMIT
+        ):
+            raise VerificationFailure("%s is not a bounded byte count" % name)
     if payload["metrics_scope"] != "process" or not isinstance(
         payload["metrics"], dict
     ):
@@ -764,6 +801,8 @@ def run_json_contract(exe: pathlib.Path) -> dict[str, Any]:
         raise VerificationFailure("nonzero child exit changed protocol classification")
     if payload["stdout"] != "out\n" or payload["stderr"] != "err\n":
         raise VerificationFailure("stdout/stderr were not kept separate")
+    if payload["stdout_size"] != 4 or payload["stderr_size"] != 4:
+        raise VerificationFailure("retained stream sizes were not reported")
     payload, completed = run_coreguard(
         exe, 250, [sys.executable, "-c", "import time; time.sleep(5)"]
     )
@@ -788,8 +827,37 @@ def run_json_contract(exe: pathlib.Path) -> dict[str, Any]:
         [sys.executable, "-c", "print('x' * (1024 * 1024 + 4096), end='')"],
     )
     cases += 1
-    if not payload["output_truncated"] or len(payload["stdout"]) > 1024 * 1024:
+    if not payload["output_truncated"] or len(payload["stdout"]) > CAPTURE_LIMIT:
         raise VerificationFailure("bounded output contract failed")
+    if payload["stdout_size"] != CAPTURE_LIMIT or payload["stderr_size"] != 0:
+        raise VerificationFailure("truncated stream sizes are not authoritative")
+    payload, completed = run_coreguard(
+        exe,
+        5000,
+        ["cmd.exe", "/d", "/c", "exit 0"],
+        memory_limit_mb=128,
+    )
+    cases += 1
+    if completed.returncode != 0 or payload["status"] != "exited":
+        raise VerificationFailure("limited run changed protocol classification")
+    if payload["applied_limits"]["memory_limit_bytes"] != 128 * 1024 * 1024:
+        raise VerificationFailure("applied memory limit is not reported in bytes")
+    version = subprocess.run(
+        [str(exe), "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=20,
+        check=False,
+    )
+    cases += 1
+    if (
+        version.returncode != 0
+        or version.stderr
+        or not version.stdout.startswith("coreguard ")
+    ):
+        raise VerificationFailure("CLI version output is not machine readable")
     return {"status": "PASS", "cases": cases}
 
 
