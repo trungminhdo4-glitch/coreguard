@@ -857,17 +857,50 @@ def run_exec_context_contract(exe: pathlib.Path) -> dict[str, Any]:
             5000,
             cwd_child,
             cwd=workdir,
-            capture_limit_bytes=64,
+            capture_limit_bytes=len(str(workdir).encode("utf-8")) + 64,
             env_clear=True,
             env=["CG_VERIFY=1"],
         )
         cases += 1
         if completed.returncode != 0 or payload["status"] != "exited":
             raise VerificationFailure("combined context run did not exit normally")
+        if payload["output_truncated"]:
+            raise VerificationFailure(
+                "combined context capture limit was smaller than the fixture cwd"
+            )
         if os.path.normcase(payload["stdout"].strip()) != os.path.normcase(
             str(workdir)
         ):
             raise VerificationFailure("combined context did not apply the cwd")
+
+        cwd_bytes = str(workdir).encode("utf-8")
+        truncating_limit = len(cwd_bytes) + 33
+        payload, completed = run_coreguard(
+            exe,
+            5000,
+            [
+                sys.executable,
+                "-c",
+                "import os, sys; sys.stdout.buffer.write("
+                "os.getcwd().encode('utf-8') + b'\\n' + b'z' * 4096)",
+            ],
+            cwd=workdir,
+            capture_limit_bytes=truncating_limit,
+            env_clear=True,
+            env=["CG_VERIFY=1"],
+        )
+        cases += 1
+        if completed.returncode != 0 or payload["status"] != "exited":
+            raise VerificationFailure("combined truncation run did not exit normally")
+        if not payload["output_truncated"]:
+            raise VerificationFailure(
+                "combined context capture limit was not enforced"
+            )
+        expected_prefix = (cwd_bytes + b"\n" + b"z" * 4096)[:truncating_limit].decode(
+            "utf-8"
+        )
+        if payload["stdout"] != expected_prefix:
+            raise VerificationFailure("combined context capture prefix was not exact")
         return {"status": "PASS", "cases": cases}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
