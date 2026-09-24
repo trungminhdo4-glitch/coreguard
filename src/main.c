@@ -8,6 +8,15 @@
 #define CG_RESOURCE_EXIT_CODE 123
 #define CG_START_EXIT_CODE 125
 #define CG_INTERNAL_EXIT_CODE 126
+#define CG_USAGE_EXIT_CODE 2
+
+/* Identifies the shape of the --json result object, not the product version.
+   Consumers must handle a different value as an incompatible contract. */
+#define CG_RESULT_CONTRACT_VERSION 1U
+
+#ifndef COREGUARD_CLI_VERSION_STRING
+#define COREGUARD_CLI_VERSION_STRING "dev"
+#endif
 
 static void print_usage(FILE *stream)
 {
@@ -15,6 +24,7 @@ static void print_usage(FILE *stream)
             "Usage: coreguard run [--json] [--timeout-ms N] "
             "[--memory-limit-mb N] [--cpu-time-limit-ms N] "
             "[--max-processes N] -- command args...\n"
+            "       coreguard --version\n"
             "       coreguard --help\n\n"
             "Runs one executable directly and contains it in a Windows Job Object.\n"
             "--memory-limit-mb applies to the complete controlled process tree.\n"
@@ -270,10 +280,41 @@ static void print_json_job_metrics(const cg_job_metrics *metrics)
     printf("  },\n");
 }
 
+static void print_json_limit_uint64(const cg_resource_limits *limits,
+                                    uint32_t field, uint64_t value)
+{
+    if (limits != NULL && (limits->valid_limits & field) != 0U) {
+        printf("%llu", (unsigned long long)value);
+    } else {
+        printf("null");
+    }
+}
+
+static void print_json_applied_limits(const cg_run_options *options)
+{
+    const cg_resource_limits *limits = options->resource_limits;
+
+    printf("  \"applied_limits\": {\n");
+    printf("    \"timeout_ms\": %llu,\n",
+           (unsigned long long)options->timeout_ms);
+    printf("    \"memory_limit_bytes\": ");
+    print_json_limit_uint64(limits, CG_RESOURCE_LIMIT_MEMORY,
+                            limits != NULL ? limits->memory_limit_bytes : 0U);
+    printf(",\n    \"cpu_time_limit_ms\": ");
+    print_json_limit_uint64(limits, CG_RESOURCE_LIMIT_CPU_TIME,
+                            limits != NULL ? limits->cpu_time_limit_ms : 0U);
+    printf(",\n    \"active_process_limit\": ");
+    print_json_limit_uint64(limits, CG_RESOURCE_LIMIT_ACTIVE_PROCESSES,
+                            limits != NULL ? limits->active_process_limit : 0U);
+    printf("\n  },\n");
+}
+
 static void print_json_result(const cg_run_result *result,
-                              const cg_job_metrics *job_metrics)
+                              const cg_job_metrics *job_metrics,
+                              const cg_run_options *options)
 {
     printf("{\n");
+    printf("  \"contract_version\": %u,\n", CG_RESULT_CONTRACT_VERSION);
     printf("  \"status\": \"%s\",\n", cg_status_name(result->status));
     if (result->has_exit_code) {
         printf("  \"exit_code\": %lu,\n", (unsigned long)result->exit_code);
@@ -294,6 +335,7 @@ static void print_json_result(const cg_run_result *result,
            (unsigned long long)result->duration_ms);
     printf("  \"process_id\": %lu,\n", (unsigned long)result->process_id);
     printf("  \"cleanup_ok\": %s,\n", result->cleanup_ok ? "true" : "false");
+    print_json_applied_limits(options);
     printf("  \"metrics_scope\": \"process\",\n");
     printf("  \"metrics\": {\n");
     printf("    \"creation_time_unix_100ns\": ");
@@ -336,6 +378,10 @@ static void print_json_result(const cg_run_result *result,
     print_json_job_metrics(job_metrics);
     printf("  \"output_truncated\": %s,\n",
            result->output_truncated ? "true" : "false");
+    printf("  \"stdout_size\": %llu,\n",
+           (unsigned long long)result->stdout_size);
+    printf("  \"stderr_size\": %llu,\n",
+           (unsigned long long)result->stderr_size);
     printf("  \"stdout\": ");
     print_json_string(stdout, result->stdout_utf8 ? result->stdout_utf8 : "",
                       result->stdout_size);
@@ -392,11 +438,15 @@ int wmain(int argc, wchar_t **argv)
     if (argc < 2 || wcscmp(argv[1], L"--help") == 0 ||
         wcscmp(argv[1], L"-h") == 0) {
         print_usage(stdout);
-        return argc < 2 ? 2 : 0;
+        return argc < 2 ? CG_USAGE_EXIT_CODE : 0;
+    }
+    if (wcscmp(argv[1], L"--version") == 0) {
+        printf("coreguard %s\n", COREGUARD_CLI_VERSION_STRING);
+        return 0;
     }
     if (wcscmp(argv[1], L"run") != 0) {
         print_usage(stderr);
-        return 2;
+        return CG_USAGE_EXIT_CODE;
     }
     for (i = 2; i < argc; i++) {
         if (wcscmp(argv[i], L"--") == 0) {
@@ -462,7 +512,7 @@ int wmain(int argc, wchar_t **argv)
         return CG_INTERNAL_EXIT_CODE;
     }
     if (json) {
-        print_json_result(&result, &job_metrics);
+        print_json_result(&result, &job_metrics, &options);
     } else {
         print_human_result(&result);
     }

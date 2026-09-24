@@ -43,6 +43,13 @@ target_compile_features(coreguard PUBLIC c_std_11)
 target_compile_features(coreguard_cli PRIVATE c_std_11)
 target_compile_definitions(coreguard PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
 target_compile_definitions(coreguard_cli PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+if(COREGUARD_VERSIONED_BUILD)
+    target_compile_definitions(coreguard_cli PRIVATE
+        COREGUARD_CLI_VERSION_STRING="${PROJECT_VERSION}")
+else()
+    target_compile_definitions(coreguard_cli PRIVATE
+        COREGUARD_CLI_VERSION_STRING="dev")
+endif()
 target_link_libraries(coreguard_cli PRIVATE coreguard)
 
 foreach(target IN ITEMS coreguard coreguard_cli)
