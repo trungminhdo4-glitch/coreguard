@@ -520,10 +520,15 @@ class CoreguardTests(unittest.TestCase):
         )
 
     def test_cpu_limit_is_not_wall_clock_timeout(self) -> None:
+        # Python startup alone can consume 30-60ms of user CPU on a loaded
+        # host (measured on the published line: 1/16 runs exceeded a 50ms
+        # job limit while sleeping), so keep a wide margin between startup
+        # CPU and the limit while the child still sleeps far below the wall
+        # timeout.
         payload, completed = self.run_json(
             1500,
             [sys.executable, "-c", "import time; time.sleep(1)"],
-            cpu_time_limit_ms=50,
+            cpu_time_limit_ms=500,
         )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(payload["status"], "exited")
