@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -285,6 +287,12 @@ class PublicConsumerTests(unittest.TestCase):
                 "alignof(cg_resource_limits)": "8",
                 "sizeof(cg_run_options)": "40",
                 "offsetof(cg_run_options,resource_limits)": "32",
+                "sizeof(cg_exec_context)": "32",
+                "alignof(cg_exec_context)": "8",
+                "offsetof(cg_exec_context,working_directory)": "0",
+                "offsetof(cg_exec_context,environment_block)": "8",
+                "offsetof(cg_exec_context,environment_block_chars)": "16",
+                "offsetof(cg_exec_context,capture_prefix_bytes)": "24",
                 "sizeof(cg_process_metrics)": "80",
                 "sizeof(cg_job_metrics)": "104",
                 "alignof(cg_job_metrics)": "8",
@@ -360,6 +368,91 @@ class PublicConsumerTests(unittest.TestCase):
         try:
             self.assert_compile_success(self, completed)
             self.assert_runs(executable)
+        finally:
+            temporary.cleanup()
+
+    def test_exec_context_consumer_scenarios(self) -> None:
+        temporary, executable, completed = self.compile_consumer(
+            CONSUMERS / "exec_context" / "main.c",
+            PUBLIC_HEADER,
+        )
+
+        def parse_probe(output: str) -> tuple[dict[str, str], str]:
+            header, _, remainder = output.partition("stdout_begin\n")
+            captured, _, _ = remainder.partition("stdout_end\n")
+            fields: dict[str, str] = {}
+            for line in header.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    fields[key] = value
+            return fields, captured
+
+        def probe(mode: str, command: list[str]) -> tuple[dict[str, str], str]:
+            completed_probe = subprocess.run(
+                [str(executable), mode, *command],
+                cwd=executable.parent,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(
+                completed_probe.returncode,
+                0,
+                completed_probe.stdout + completed_probe.stderr,
+            )
+            return parse_probe(completed_probe.stdout)
+
+        try:
+            self.assert_compile_success(self, completed)
+            cwd_child = [sys.executable, "-c", "import os; print(os.getcwd())"]
+            env_child = [
+                sys.executable,
+                "-c",
+                "import os, json; print(json.dumps("
+                "{k: v for k, v in os.environ.items() "
+                "if not k.startswith('=')}, sort_keys=True))",
+            ]
+            echo_child = [sys.executable, "-c", "print('x' * 500, end='')"]
+
+            fields, captured = probe("null", [sys.executable, "-c", "print('null-ok')"])
+            self.assertEqual(fields["status"], "exited")
+            self.assertEqual(fields["has_exit_code"], "1")
+            self.assertEqual(fields["exit_code"], "0")
+            self.assertEqual(captured, "null-ok\n")
+
+            work = str(executable.parent)
+            fields, captured = probe(f"cwd:{work}", cwd_child)
+            self.assertEqual(fields["status"], "exited")
+            self.assertEqual(
+                os.path.normcase(captured.strip()),
+                os.path.normcase(work),
+            )
+
+            fields, captured = probe("env-empty", env_child)
+            self.assertEqual(fields["status"], "exited")
+            self.assertEqual(json.loads(captured), {})
+
+            fields, captured = probe("limit:64", echo_child)
+            self.assertEqual(fields["status"], "exited")
+            self.assertEqual(fields["stdout_size"], "64")
+            self.assertEqual(fields["output_truncated"], "1")
+            self.assertEqual(captured, "x" * 64)
+
+            for mode in (
+                "env-bad-termination",
+                "env-bad-interior",
+                "chars-without-block",
+                "cwd-empty",
+                "limit-over-max",
+            ):
+                with self.subTest(mode=mode):
+                    fields, _ = probe(mode, echo_child)
+                    self.assertEqual(fields["status"], "usage_error")
+                    self.assertEqual(fields["has_exit_code"], "0")
+                    self.assertEqual(fields["stdout_size"], "0")
         finally:
             temporary.cleanup()
 

@@ -13,7 +13,6 @@
 #pragma comment(lib, "psapi.lib")
 
 #define CG_MAX_COMMAND_LINE 32767U
-#define CG_OUTPUT_LIMIT (1024U * 1024U)
 #define CG_TIMEOUT_GRACE_MS 5000U
 #define CG_RESOURCE_POLL_MS 5U
 #define CG_RESOURCE_TERMINATION_CODE 123U
@@ -46,6 +45,7 @@ typedef struct cg_capture_pipe {
     cg_read_file_fn read_file;
     char *data;
     size_t size;
+    size_t limit;
     volatile LONG read_error;
     volatile LONG truncated;
     int thread_joined;
@@ -753,6 +753,7 @@ static void cg_capture_init(cg_capture_pipe *capture)
     capture->read_file = NULL;
     capture->data = NULL;
     capture->size = 0U;
+    capture->limit = 0U;
     capture->read_error = (LONG)ERROR_SUCCESS;
     capture->truncated = 0;
     capture->thread_joined = 0;
@@ -822,19 +823,25 @@ static void cg_capture_destroy(cg_capture_pipe *capture)
     free(capture);
 }
 
-static int cg_capture_create(cg_capture_pipe **capture_out, DWORD *error_out)
+static int cg_capture_create(cg_capture_pipe **capture_out, size_t limit,
+                             DWORD *error_out)
 {
     cg_capture_pipe *capture;
     SECURITY_ATTRIBUTES attributes;
 
     *capture_out = NULL;
+    if (limit == 0U || limit > (size_t)CG_CAPTURE_PREFIX_MAX_BYTES) {
+        *error_out = ERROR_INVALID_PARAMETER;
+        return 0;
+    }
     capture = (cg_capture_pipe *)calloc(1U, sizeof(*capture));
     if (capture == NULL) {
         *error_out = ERROR_NOT_ENOUGH_MEMORY;
         return 0;
     }
     cg_capture_init(capture);
-    capture->data = (char *)malloc((size_t)CG_OUTPUT_LIMIT + 1U);
+    capture->limit = limit;
+    capture->data = (char *)malloc(limit + 1U);
     if (capture->data == NULL) {
         *error_out = ERROR_NOT_ENOUGH_MEMORY;
         cg_capture_destroy(capture);
@@ -938,8 +945,8 @@ static DWORD WINAPI cg_capture_reader(LPVOID parameter)
             cg_capture_signal_failure(capture, ERROR_INVALID_DATA);
             break;
         }
-        remaining = capture->size < (size_t)CG_OUTPUT_LIMIT
-                        ? (size_t)CG_OUTPUT_LIMIT - capture->size
+        remaining = capture->size < capture->limit
+                        ? capture->limit - capture->size
                         : 0U;
         copy_size = (size_t)bytes_read;
         if (copy_size > remaining) {
@@ -1349,6 +1356,7 @@ static cg_windows_test_hooks cg_default_windows_hooks(void)
 
 static int cg_windows_run_internal(
     const cg_run_options *options,
+    const cg_exec_context *context,
     cg_run_result *result,
     cg_job_metrics *job_metrics,
     const cg_windows_test_hooks *hooks)
@@ -1390,6 +1398,9 @@ static int cg_windows_run_internal(
     int poll_completion_port;
     uint64_t cpu_time_limit_ticks = 0U;
     const cg_resource_limits *resource_limits = options->resource_limits;
+    const wchar_t *working_directory;
+    const wchar_t *environment_block;
+    size_t capture_prefix;
 
     cg_capture_reap_quarantined();
     if (hooks == NULL || hooks->query_job_information == NULL ||
@@ -1424,6 +1435,11 @@ static int cg_windows_run_internal(
     cpu_time_limit_enabled = cg_cpu_time_limit_enabled(resource_limits);
     active_process_limit_enabled =
         cg_active_process_limit_enabled(resource_limits);
+    working_directory = context != NULL ? context->working_directory : NULL;
+    environment_block = context != NULL ? context->environment_block : NULL;
+    capture_prefix = context != NULL && context->capture_prefix_bytes != 0U
+                         ? context->capture_prefix_bytes
+                         : (size_t)CG_CAPTURE_PREFIX_DEFAULT_BYTES;
     poll_completion_port = 0;
 
     job = CreateJobObjectW(NULL, NULL);
@@ -1480,8 +1496,8 @@ static int cg_windows_run_internal(
         memory_limit_enabled ||
         (cpu_time_limit_enabled && completion_port != NULL);
     if (options->capture_output) {
-        if (!cg_capture_create(&stdout_capture, &last_error) ||
-            !cg_capture_create(&stderr_capture, &last_error)) {
+        if (!cg_capture_create(&stdout_capture, capture_prefix, &last_error) ||
+            !cg_capture_create(&stderr_capture, capture_prefix, &last_error)) {
             cg_set_error(result, last_error);
             result->status = CG_STATUS_INTERNAL_ERROR;
             goto cleanup;
@@ -1597,7 +1613,8 @@ static int cg_windows_run_internal(
             inherited_handle_count > 0,
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
                 (inherited_handle_count > 0 ? EXTENDED_STARTUPINFO_PRESENT : 0),
-            NULL, NULL, &startup_info.StartupInfo, &process_info)) {
+            (LPVOID)environment_block, working_directory,
+            &startup_info.StartupInfo, &process_info)) {
         cg_set_error(result, GetLastError());
         result->status = CG_STATUS_START_FAILED;
         goto cleanup;
@@ -1881,11 +1898,14 @@ cleanup:
     return 0;
 }
 
-int cg_windows_run(const cg_run_options *options, cg_run_result *result,
+int cg_windows_run(const cg_run_options *options,
+                   const cg_exec_context *context,
+                   cg_run_result *result,
                    cg_job_metrics *job_metrics)
 {
     cg_windows_test_hooks hooks = cg_default_windows_hooks();
-    return cg_windows_run_internal(options, result, job_metrics, &hooks);
+    return cg_windows_run_internal(options, context, result, job_metrics,
+                                   &hooks);
 }
 
 #ifdef COREGUARD_TEST_HOOKS
@@ -1901,7 +1921,7 @@ int cg_windows_run_with_job_metrics_query_hook(
         return -1;
     }
     hooks.query_job_information = query_job_information;
-    return cg_windows_run_internal(options, result, job_metrics, &hooks);
+    return cg_windows_run_internal(options, NULL, result, job_metrics, &hooks);
 }
 
 int cg_windows_run_with_test_hooks(
@@ -1933,7 +1953,7 @@ int cg_windows_run_with_test_hooks(
     if (test_hooks->capture_cancel_grace_ms != 0U) {
         hooks.capture_cancel_grace_ms = test_hooks->capture_cancel_grace_ms;
     }
-    return cg_windows_run_internal(options, result, job_metrics, &hooks);
+    return cg_windows_run_internal(options, NULL, result, job_metrics, &hooks);
 }
 
 LONG cg_windows_test_quarantined_capture_count(void)

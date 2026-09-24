@@ -1,6 +1,9 @@
 #include "coreguard.h"
 
+#include <windows.h>
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CG_DEFAULT_TIMEOUT_MS 120000ULL
@@ -14,12 +17,223 @@ static void print_usage(FILE *stream)
     fprintf(stream,
             "Usage: coreguard run [--json] [--timeout-ms N] "
             "[--memory-limit-mb N] [--cpu-time-limit-ms N] "
-            "[--max-processes N] -- command args...\n"
+            "[--max-processes N] [--cwd DIR] [--env-clear] "
+            "[--env NAME=VALUE] [--capture-limit-bytes N] -- command args...\n"
             "       coreguard --help\n\n"
             "Runs one executable directly and contains it in a Windows Job Object.\n"
             "--memory-limit-mb applies to the complete controlled process tree.\n"
             "--cpu-time-limit-ms applies job-wide user-mode CPU time.\n"
-            "--max-processes applies to simultaneously active processes; the root counts.\n");
+            "--max-processes applies to simultaneously active processes; the root counts.\n"
+            "--cwd sets the child working directory; the default inherits the caller's.\n"
+            "--env-clear starts an empty child environment; --env adds or overrides\n"
+            "  one NAME=VALUE entry (repeatable; names match case-insensitively).\n"
+            "--capture-limit-bytes bounds the retained capture prefix per stream\n"
+            "  and requires --json.\n");
+}
+
+typedef struct cg_env_pool {
+    const wchar_t **items;
+    size_t count;
+    size_t capacity;
+} cg_env_pool;
+
+typedef struct cg_env_block {
+    wchar_t *block;
+    size_t chars;
+    wchar_t *parent;
+} cg_env_block;
+
+static void cg_env_pool_release(cg_env_pool *pool)
+{
+    free((void *)pool->items);
+    pool->items = NULL;
+    pool->count = 0U;
+    pool->capacity = 0U;
+}
+
+static int cg_env_pool_append(cg_env_pool *pool, const wchar_t *entry)
+{
+    if (pool->count == pool->capacity) {
+        size_t capacity = pool->capacity == 0U ? 32U : pool->capacity * 2U;
+        const wchar_t **items;
+
+        if (capacity < pool->capacity) {
+            return 0;
+        }
+        items = (const wchar_t **)realloc((void *)pool->items,
+                                          capacity * sizeof(items[0]));
+        if (items == NULL) {
+            return 0;
+        }
+        pool->items = items;
+        pool->capacity = capacity;
+    }
+    pool->items[pool->count] = entry;
+    pool->count++;
+    return 1;
+}
+
+static size_t cg_env_key_length(const wchar_t *assignment)
+{
+    size_t length = 0U;
+
+    while (assignment[length] != L'\0' && assignment[length] != L'=') {
+        length++;
+    }
+    return length;
+}
+
+static int cg_env_key_matches(const wchar_t *entry, const wchar_t *assignment,
+                              size_t key_length)
+{
+    size_t index;
+
+    if (key_length == 0U || key_length > (size_t)INT_MAX) {
+        return 0;
+    }
+    for (index = 0U; index < key_length; index++) {
+        if (entry[index] == L'\0') {
+            return 0;
+        }
+    }
+    if (CompareStringOrdinal(entry, (int)key_length, assignment,
+                             (int)key_length, TRUE) != CSTR_EQUAL) {
+        return 0;
+    }
+    return entry[key_length] == L'=';
+}
+
+static int cg_env_override_valid(const wchar_t *assignment)
+{
+    size_t key_length = cg_env_key_length(assignment);
+
+    return key_length > 0U && key_length <= (size_t)INT_MAX &&
+           assignment[key_length] == L'=';
+}
+
+static int cg_env_override_duplicate(const cg_env_pool *overrides,
+                                     const wchar_t *assignment)
+{
+    size_t key_length = cg_env_key_length(assignment);
+    size_t index;
+
+    for (index = 0U; index < overrides->count; index++) {
+        if (cg_env_key_matches(overrides->items[index], assignment,
+                               key_length)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int __cdecl cg_env_entry_compare(const void *left, const void *right)
+{
+    const wchar_t *left_entry = *(const wchar_t *const *)left;
+    const wchar_t *right_entry = *(const wchar_t *const *)right;
+    int result = CompareStringOrdinal(left_entry, -1, right_entry, -1, TRUE);
+
+    if (result == CSTR_LESS_THAN) {
+        return -1;
+    }
+    if (result == CSTR_GREATER_THAN) {
+        return 1;
+    }
+    return 0;
+}
+
+static int cg_env_build_block(const cg_env_pool *pool, cg_env_block *out)
+{
+    size_t total;
+    size_t index;
+    size_t position = 0U;
+    wchar_t *block;
+
+    total = pool->count == 0U ? 2U : 1U;
+    for (index = 0U; index < pool->count; index++) {
+        size_t length = wcslen(pool->items[index]);
+
+        if (total > (size_t)-1 - (length + 1U)) {
+            return 0;
+        }
+        total += length + 1U;
+    }
+    block = (wchar_t *)malloc(total * sizeof(block[0]));
+    if (block == NULL) {
+        return 0;
+    }
+    for (index = 0U; index < pool->count; index++) {
+        size_t length = wcslen(pool->items[index]);
+
+        memcpy(block + position, pool->items[index],
+               (length + 1U) * sizeof(block[0]));
+        position += length + 1U;
+    }
+    block[position] = L'\0';
+    position++;
+    if (pool->count == 0U) {
+        block[position] = L'\0';
+        position++;
+    }
+    out->block = block;
+    out->chars = position;
+    return 1;
+}
+
+static int cg_env_prepare(const cg_env_pool *overrides, int clear,
+                          cg_env_block *out)
+{
+    cg_env_pool merged = {0};
+    const wchar_t *cursor;
+    size_t index;
+    int ok = 0;
+
+    out->block = NULL;
+    out->chars = 0U;
+    out->parent = NULL;
+    if (!clear) {
+        out->parent = GetEnvironmentStringsW();
+        if (out->parent == NULL) {
+            return 0;
+        }
+        cursor = out->parent;
+        while (*cursor != L'\0') {
+            size_t length = wcslen(cursor);
+
+            if (!cg_env_override_duplicate(overrides, cursor) &&
+                !cg_env_pool_append(&merged, cursor)) {
+                goto done;
+            }
+            cursor += length + 1U;
+        }
+    }
+    for (index = 0U; index < overrides->count; index++) {
+        if (!cg_env_pool_append(&merged, overrides->items[index])) {
+            goto done;
+        }
+    }
+    if (merged.count > 1U) {
+        qsort(merged.items, merged.count, sizeof(merged.items[0]),
+              cg_env_entry_compare);
+    }
+    ok = cg_env_build_block(&merged, out);
+done:
+    cg_env_pool_release(&merged);
+    if (!ok && out->parent != NULL) {
+        LocalFree(out->parent);
+        out->parent = NULL;
+    }
+    return ok;
+}
+
+static void cg_env_block_release(cg_env_block *env)
+{
+    free(env->block);
+    env->block = NULL;
+    env->chars = 0U;
+    if (env->parent != NULL) {
+        LocalFree(env->parent);
+        env->parent = NULL;
+    }
 }
 
 static int parse_positive_uint64(const wchar_t *text, uint64_t maximum,
@@ -383,7 +597,15 @@ int wmain(int argc, wchar_t **argv)
     int memory_limit_set = 0;
     int cpu_time_limit_set = 0;
     int active_process_limit_set = 0;
+    int env_clear = 0;
+    int capture_limit_set = 0;
+    const wchar_t *cwd = NULL;
+    uint64_t capture_limit = 0;
     cg_resource_limits resource_limits = {0};
+    cg_env_pool env_overrides = {0};
+    cg_env_block env_block = {0};
+    cg_exec_context context = {0};
+    const cg_exec_context *context_ptr = NULL;
     cg_run_options options;
     cg_run_result result;
     cg_job_metrics job_metrics = {0};
@@ -408,14 +630,14 @@ int wmain(int argc, wchar_t **argv)
         } else if (wcscmp(argv[i], L"--timeout-ms") == 0 && i + 1 < argc) {
             if (!parse_timeout(argv[++i], &timeout_ms)) {
                 fprintf(stderr, "coreguard: invalid --timeout-ms\n");
-                return 2;
+                goto usage_error;
             }
         } else if (wcscmp(argv[i], L"--memory-limit-mb") == 0 &&
                    i + 1 < argc) {
             if (memory_limit_set ||
                 !parse_memory_limit_mb(argv[++i], &resource_limits)) {
                 fprintf(stderr, "coreguard: invalid --memory-limit-mb\n");
-                return 2;
+                goto usage_error;
             }
             memory_limit_set = 1;
         } else if (wcscmp(argv[i], L"--cpu-time-limit-ms") == 0 &&
@@ -423,7 +645,7 @@ int wmain(int argc, wchar_t **argv)
             if (cpu_time_limit_set ||
                 !parse_cpu_time_limit_ms(argv[++i], &resource_limits)) {
                 fprintf(stderr, "coreguard: invalid --cpu-time-limit-ms\n");
-                return 2;
+                goto usage_error;
             }
             cpu_time_limit_set = 1;
         } else if (wcscmp(argv[i], L"--max-processes") == 0 &&
@@ -431,18 +653,57 @@ int wmain(int argc, wchar_t **argv)
             if (active_process_limit_set ||
                 !parse_active_process_limit(argv[++i], &resource_limits)) {
                 fprintf(stderr, "coreguard: invalid --max-processes\n");
-                return 2;
+                goto usage_error;
             }
             active_process_limit_set = 1;
+        } else if (wcscmp(argv[i], L"--cwd") == 0 && i + 1 < argc) {
+            if (cwd != NULL || argv[i + 1][0] == L'\0') {
+                fprintf(stderr, "coreguard: invalid --cwd\n");
+                goto usage_error;
+            }
+            cwd = argv[++i];
+        } else if (wcscmp(argv[i], L"--env-clear") == 0) {
+            env_clear = 1;
+        } else if (wcscmp(argv[i], L"--env") == 0 && i + 1 < argc) {
+            const wchar_t *assignment = argv[++i];
+
+            if (!cg_env_override_valid(assignment) ||
+                cg_env_override_duplicate(&env_overrides, assignment) ||
+                !cg_env_pool_append(&env_overrides, assignment)) {
+                fprintf(stderr, "coreguard: invalid or duplicate --env\n");
+                goto usage_error;
+            }
+        } else if (wcscmp(argv[i], L"--capture-limit-bytes") == 0 &&
+                   i + 1 < argc) {
+            if (capture_limit_set ||
+                !parse_positive_uint64(argv[++i], CG_CAPTURE_PREFIX_MAX_BYTES,
+                                       &capture_limit)) {
+                fprintf(stderr,
+                        "coreguard: invalid --capture-limit-bytes\n");
+                goto usage_error;
+            }
+            capture_limit_set = 1;
         } else {
             fprintf(stderr, "coreguard: unknown or incomplete option\n");
-            return 2;
+            goto usage_error;
         }
     }
     if (separator < 0 || separator + 1 >= argc) {
         fprintf(stderr, "coreguard: expected '-- command args...'\n");
-        return 2;
+        goto usage_error;
     }
+    if (capture_limit_set && !json) {
+        fprintf(stderr, "coreguard: --capture-limit-bytes requires --json\n");
+        goto usage_error;
+    }
+    if (env_overrides.count > 0U || env_clear) {
+        if (!cg_env_prepare(&env_overrides, env_clear, &env_block)) {
+            cg_env_pool_release(&env_overrides);
+            fprintf(stderr, "coreguard: could not build the environment\n");
+            return CG_INTERNAL_EXIT_CODE;
+        }
+    }
+    cg_env_pool_release(&env_overrides);
 
     options.argv = (const wchar_t *const *)&argv[separator + 1];
     options.argc = (size_t)(argc - separator - 1);
@@ -452,13 +713,26 @@ int wmain(int argc, wchar_t **argv)
                                active_process_limit_set)
                                   ? &resource_limits
                                   : NULL;
+    if (cwd != NULL || env_block.block != NULL || capture_limit_set) {
+        context.working_directory = cwd;
+        context.environment_block = env_block.block;
+        context.environment_block_chars = env_block.chars;
+        context.capture_prefix_bytes =
+            capture_limit_set ? (size_t)capture_limit : 0U;
+        context_ptr = &context;
+    }
     if (json) {
-        rc = cg_run_with_job_metrics(&options, &result, &job_metrics);
+        rc = context_ptr != NULL
+                 ? cg_run_ex_with_job_metrics(&options, context_ptr, &result,
+                                              &job_metrics)
+                 : cg_run_with_job_metrics(&options, &result, &job_metrics);
     } else {
-        rc = cg_run(&options, &result);
+        rc = context_ptr != NULL ? cg_run_ex(&options, context_ptr, &result)
+                                 : cg_run(&options, &result);
     }
     if (rc != 0) {
         fprintf(stderr, "coreguard: internal API failure\n");
+        cg_env_block_release(&env_block);
         return CG_INTERNAL_EXIT_CODE;
     }
     if (json) {
@@ -481,5 +755,10 @@ int wmain(int argc, wchar_t **argv)
         rc = (int)(result.exit_code & 0xffU);
     }
     cg_run_result_free(&result);
+    cg_env_block_release(&env_block);
     return rc;
+
+usage_error:
+    cg_env_pool_release(&env_overrides);
+    return 2;
 }

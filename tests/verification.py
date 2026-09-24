@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,10 @@ def run_coreguard(
     memory_limit_mb: int | None = None,
     cpu_time_limit_ms: int | None = None,
     max_processes: int | None = None,
+    cwd: pathlib.Path | None = None,
+    env_clear: bool = False,
+    env: list[str] | None = None,
+    capture_limit_bytes: int | None = None,
 ) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
     runner = [str(exe), "run", "--json", "--timeout-ms", str(timeout_ms)]
     if memory_limit_mb is not None:
@@ -70,6 +75,14 @@ def run_coreguard(
         runner.extend(["--cpu-time-limit-ms", str(cpu_time_limit_ms)])
     if max_processes is not None:
         runner.extend(["--max-processes", str(max_processes)])
+    if cwd is not None:
+        runner.extend(["--cwd", str(cwd)])
+    if env_clear:
+        runner.append("--env-clear")
+    for entry in env or ():
+        runner.extend(["--env", entry])
+    if capture_limit_bytes is not None:
+        runner.extend(["--capture-limit-bytes", str(capture_limit_bytes)])
     runner.extend(["--", *command])
     try:
         completed = subprocess.run(
@@ -793,6 +806,73 @@ def run_json_contract(exe: pathlib.Path) -> dict[str, Any]:
     return {"status": "PASS", "cases": cases}
 
 
+def run_exec_context_contract(exe: pathlib.Path) -> dict[str, Any]:
+    cases = 0
+    workdir = pathlib.Path(tempfile.mkdtemp(prefix="coreguard-exec-context-"))
+    try:
+        cwd_child = [sys.executable, "-c", "import os; print(os.getcwd())"]
+        env_child = [
+            sys.executable,
+            "-c",
+            "import os, json; print(json.dumps("
+            "{k: v for k, v in os.environ.items() "
+            "if not k.startswith('=')}, sort_keys=True))",
+        ]
+
+        payload, completed = run_coreguard(exe, 5000, cwd_child, cwd=workdir)
+        cases += 1
+        if completed.returncode != 0 or payload["status"] != "exited":
+            raise VerificationFailure("cwd context run did not exit normally")
+        if os.path.normcase(payload["stdout"].strip()) != os.path.normcase(
+            str(workdir)
+        ):
+            raise VerificationFailure("child did not observe the requested cwd")
+
+        payload, completed = run_coreguard(
+            exe, 5000, env_child, env_clear=True, env=["CG_VERIFY=1", "CG_SECOND=2"]
+        )
+        cases += 1
+        if completed.returncode != 0 or payload["status"] != "exited":
+            raise VerificationFailure("environment context run did not exit normally")
+        if parse_single_json(payload["stdout"]) != {
+            "CG_SECOND": "2",
+            "CG_VERIFY": "1",
+        }:
+            raise VerificationFailure(
+                "child environment was not exactly the requested block"
+            )
+
+        payload, completed = run_coreguard(
+            exe,
+            5000,
+            [sys.executable, "-c", "print('y' * 4096, end='')"],
+            capture_limit_bytes=128,
+        )
+        cases += 1
+        if len(payload["stdout"]) != 128 or not payload["output_truncated"]:
+            raise VerificationFailure("capture prefix limit was not enforced")
+
+        payload, completed = run_coreguard(
+            exe,
+            5000,
+            cwd_child,
+            cwd=workdir,
+            capture_limit_bytes=64,
+            env_clear=True,
+            env=["CG_VERIFY=1"],
+        )
+        cases += 1
+        if completed.returncode != 0 or payload["status"] != "exited":
+            raise VerificationFailure("combined context run did not exit normally")
+        if os.path.normcase(payload["stdout"].strip()) != os.path.normcase(
+            str(workdir)
+        ):
+            raise VerificationFailure("combined context did not apply the cwd")
+        return {"status": "PASS", "cases": cases}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def require_metric(payload: dict[str, Any], name: str) -> int:
     value = payload["metrics"].get(name)
     if not isinstance(value, int) or value < 0:
@@ -1374,6 +1454,7 @@ def run_full(
         "cpu_enforcement": run_cpu_enforcement(exe),
         "active_process_enforcement": run_active_process_enforcement(exe),
         "argument_roundtrip_and_properties": run_roundtrip(exe, seed),
+        "execution_context": run_exec_context_contract(exe),
         "timeout_boundary": run_timeout_boundary(exe, boundary_timeout_ms),
         "failure_injection": run_failure_injection(exe),
         "handle_lifecycle_stress": run_handle_stress(exe),
