@@ -40,3 +40,22 @@ Details:
 
 - Measured the sleeping Python child's user CPU on the unchanged published line: 0-62 ms across 16 runs, 1 run tripped the 50 ms limit (identical failure mode on `origin/main`, so not a regression of this branch).
 - The child still sleeps ~1 s against a 1500 ms wall timeout; the test keeps proving that a CPU limit is not reported as a wall-clock timeout.
+
+### 2026-09-24 - Bounded stdin payload + CPU-limit enforcement fix
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | `cg_exec_context.stdin_data`/`stdin_size` (max. 64 KiB, thread-freie Pipe), CLI `--stdin-file`, plus Regressions-Fix fuer die CPU-Limit-Durchsetzung |
+| Commit | `1ff3a56` (stdin), `396a898` (CPU-Fix) |
+| Ergebnis | OK - Clean-Rebuild MSVC Release /W4 /WX /analyze; 126 unittest OK (2 skip); verification.py PASS (execution_context 6 Cases, cpu_enforcement PASS) |
+
+Details:
+
+- Branch `agent/coreguard-stdin-context`, gestapelt auf `agent/coreguard-execution-context` (PR #11).
+- stdin: 128-KiB-Pipe-Puffer, Payload (1 B..64 KiB) wird vor `ResumeThread` geschrieben und die Write-Seite geschlossen. Ein WriteFile bis zur Puffergroesse blockiert nie (empirisch belegt: 64 KiB in 64-KiB-Puffer ok, 128 KiB in 64-KiB-Puffer blockiert) -> kein Writer-Thread, kein Deadlock bei einem Kind, das stdin ignoriert. `NULL` erbt weiterhin das Eltern-stdin.
+- CLI `--stdin-file PATH` (rohe Bytes; fehlende/leere/zu grosse Dateien -> Exit 2). Layout-Manifest: 48 B, Offsets stdin_data=32, stdin_size=40.
+- **Befund + Fix**: Der Commit `2baa66d` (Codex, in PR #11) setzt CPU-only-Limits nicht mehr durch: Ein Job-Handle signalisiert beim Prozess-Exit, nicht beim Erreichen des CPU-Limits. Gemessen mit demselben 5-s-Burner gegen `origin/main` (29cf2f5): 200 ms Limit -> ~0.24 s vs. 1.9-5.1 s; 2000 ms Limit -> ~2.0 s vs. ~5.1 s. `396a898` stellt den 5-ms-Accounting-Poll wieder her und entfernt den toten Job-Wait-Zweig; danach wieder ~0.21-0.26 s bzw. ~2.05-2.13 s (gleich zur Baseline). Der Enforcement-Test hat jetzt eine Laufzeitschranke.
+- Gotcha: Ein inkrementeller MSBuild-Rebuild lieferte ein stale Binary (der Fix schien zunaechst wirkungslos); erst ein Clean-Rebuild zeigte das korrekte Verhalten. Bei Enforcement-Messungen `build/` vorher loeschen.
+- Beweise: `python -m unittest discover -s tests -p "test_*.py"` (126 OK, 2 skip); `python tests/verification.py --exe build\Release\coreguard.exe` PASS; Messreihen `cg_burn_probe`/`cg_cpu_ticks_probe` gegen den `origin/main`-Build.
+- Nicht gepusht (Owner-Gate). Wichtig fuer die Integration: PR #11 enthaelt den Regressions-Commit; dieser Branch muss mit oder direkt nach #11 gemergt werden.
