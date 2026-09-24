@@ -349,42 +349,22 @@ static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
         }
 
         remaining = deadline - now;
-        wait_ms = poll_completion_port && remaining > CG_RESOURCE_POLL_MS
+        wait_ms = remaining > CG_RESOURCE_POLL_MS
                       ? CG_RESOURCE_POLL_MS
                       : (DWORD)remaining;
         if (wait_ms == 0U) {
             wait_ms = 1U;
         }
-        if (!poll_completion_port && cpu_time_limit_ticks != 0U) {
-            HANDLE wait_handles[3];
-            DWORD handle_count = 2U;
-            wait_handles[0] = process;
-            wait_handles[1] = job;
-            if (output_failure_event != NULL) {
-                wait_handles[handle_count++] = output_failure_event;
-            }
-            wait_result = WaitForMultipleObjects(handle_count, wait_handles,
-                                                 FALSE, wait_ms);
-            if (wait_result == WAIT_OBJECT_0 + 1U) {
-                *resource_flags |= CG_RESOURCE_FLAG_CPU_TIME;
-                return CG_WAIT_RESOURCE;
-            }
-            if (output_failure_event != NULL &&
-                wait_result == WAIT_OBJECT_0 + 2U) {
-                return CG_WAIT_OUTPUT;
-            }
+        if (output_failure_event == NULL) {
+            wait_result = WaitForSingleObject(process, wait_ms);
         } else {
-            if (output_failure_event == NULL) {
-                wait_result = WaitForSingleObject(process, wait_ms);
-            } else {
-                HANDLE wait_handles[2];
-                wait_handles[0] = process;
-                wait_handles[1] = output_failure_event;
-                wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
-                                                     wait_ms);
-                if (wait_result == WAIT_OBJECT_0 + 1U) {
-                    return CG_WAIT_OUTPUT;
-                }
+            HANDLE wait_handles[2];
+            wait_handles[0] = process;
+            wait_handles[1] = output_failure_event;
+            wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
+                                                 wait_ms);
+            if (wait_result == WAIT_OBJECT_0 + 1U) {
+                return CG_WAIT_OUTPUT;
             }
         }
         if (wait_result == WAIT_FAILED) {
@@ -1492,9 +1472,7 @@ static int cg_windows_run_internal(
         result->status = CG_STATUS_CONTAINMENT_FAILED;
         goto cleanup;
     }
-    poll_completion_port =
-        memory_limit_enabled ||
-        (cpu_time_limit_enabled && completion_port != NULL);
+    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled;
     if (options->capture_output) {
         if (!cg_capture_create(&stdout_capture, capture_prefix, &last_error) ||
             !cg_capture_create(&stderr_capture, capture_prefix, &last_error)) {

@@ -518,6 +518,10 @@ class CoreguardTests(unittest.TestCase):
             self.job_metric(payload, "total_user_cpu_ms"),
             payload["metrics"]["user_cpu_ms"],
         )
+        # Prompt enforcement: the helper burns for 5 s of wall time, so a run
+        # that classifies the 200 ms job CPU limit only after natural exit
+        # cannot finish below this bound.
+        self.assertLess(payload["duration_ms"], 3000)
 
     def test_cpu_limit_is_not_wall_clock_timeout(self) -> None:
         # Python startup alone can consume 30-60ms of user CPU on a loaded

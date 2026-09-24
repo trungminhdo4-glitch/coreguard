@@ -41,6 +41,7 @@ class BoundedOutputSourceTests(unittest.TestCase):
         spawn = run.index("CreateProcessW(")
         assign = run.index("hooks->assign_process_to_job(job, process)")
         start_reader = run.index("cg_capture_start(stdout_capture")
+        stdin_write = run.index("cg_stdin_write(")
         resume = run.index("ResumeThread(thread)")
         metrics = run.index("cg_collect_job_metrics(job")
         close_job = run.index("CloseHandle(job)")
@@ -52,7 +53,9 @@ class BoundedOutputSourceTests(unittest.TestCase):
         self.assertLess(close_source, spawn)
         self.assertLess(spawn, assign)
         self.assertLess(assign, start_reader)
-        self.assertLess(start_reader, resume)
+        self.assertLess(start_reader, stdin_write)
+        self.assertLess(stdin_write, resume)
+        self.assertIn("cg_stdin_pipe_create", run)
         self.assertLess(metrics, close_job)
         self.assertLess(close_job, join_reader)
         self.assertIn("PROC_THREAD_ATTRIBUTE_HANDLE_LIST", run)
@@ -88,28 +91,24 @@ class BoundedOutputSourceTests(unittest.TestCase):
         self.assertIn("cg_terminate_unassigned_process", source)
         self.assertIn("DWORD boundary_wait = WaitForSingleObject(process, 0)", source)
 
-    def test_cpu_only_wait_blocks_on_process_and_job_signals(self) -> None:
+    def test_cpu_only_wait_polls_accounting_at_bounded_intervals(self) -> None:
         source = WINDOWS_PROCESS.read_text(encoding="utf-8")
         wait = source.split("static DWORD cg_wait_for_process", 1)[1].split(
             "static uint64_t cg_filetime_value", 1
         )[0]
         run = source.split("static int cg_windows_run_internal", 1)[1]
 
+        # A CPU-time limit needs the bounded poll: the job handle signals when
+        # its processes exit, not when the limit is reached, so blocking on it
+        # would classify the limit only after the workload finished.
         self.assertIn(
-            "memory_limit_enabled ||\n"
-            "        (cpu_time_limit_enabled && completion_port != NULL)",
-            run,
-        )
-        self.assertNotIn(
             "poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled",
             run,
         )
-        self.assertIn(
-            "wait_ms = poll_completion_port && remaining > CG_RESOURCE_POLL_MS",
-            wait,
-        )
-        self.assertIn("wait_handles[1] = job", wait)
-        self.assertIn("WaitForMultipleObjects(handle_count", wait)
+        self.assertIn("wait_ms = remaining > CG_RESOURCE_POLL_MS", wait)
+        self.assertIn("cg_check_cpu_accounting(job, cpu_time_limit_ticks", wait)
+        self.assertIn("return CG_WAIT_RESOURCE;", wait)
+        self.assertNotIn("wait_handles[1] = job", wait)
 
     def test_native_proof_checks_both_prefixes_timeout_and_temp_directory(self) -> None:
         consumer = NATIVE_CONSUMER.read_text(encoding="utf-8")
