@@ -32,6 +32,21 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
 HANDLE_COUNT_TOLERANCE = 4
 SEED = 0xC0DE03
+# The tree fixture starts a Python interpreter and spawns a grandchild before
+# it can publish its two PIDs, so the timeout is a precondition for observing
+# the tree, not a product threshold. Measured fixture readiness with CoreGuard
+# in the loop (120 samples, reference box): p50 72-75 ms, p95 109-127 ms,
+# max 140 ms. The former 100 ms budget therefore sat below the fixture's own
+# p90 and failed 3 of 150 runs (~2 % per call, ~17 % per nine-call stress
+# section); 300 ms measured 0 of 150 runs.
+TREE_STRESS_TIMEOUT_MS = 300
+# A host stall can delay the whole pipeline for seconds (one measured run
+# spent 4.8 s on a 1000 ms budget), so a single missed precondition is retried
+# once with a stall-tolerant budget. Classification, cleanup and PID
+# containment are re-asserted on the retry, and a fault that keeps the tree
+# alive or prevents it from ever existing still fails closed.
+TREE_STRESS_STALL_TIMEOUT_MS = 5000
+TREE_STRESS_READY_GRACE_SECONDS = 0.5
 
 
 class VerificationFailure(RuntimeError):
@@ -238,7 +253,19 @@ def assert_pids_gone(pids: list[int], timeout_seconds: float = 3.0) -> None:
             raise VerificationFailure("PID %d survived timeout" % pid)
 
 
-def run_tree_timeout(exe: pathlib.Path, timeout_ms: int = 500) -> dict[str, Any]:
+def published_tree_pids(pid_file: pathlib.Path) -> list[int] | None:
+    """Fixture PIDs already on disk, or None when the fixture was killed first."""
+    try:
+        return wait_for_pid_file(
+            pid_file, timeout_seconds=TREE_STRESS_READY_GRACE_SECONDS
+        )
+    except VerificationFailure:
+        return None
+
+
+def run_tree_timeout(
+    exe: pathlib.Path, timeout_ms: int = TREE_STRESS_TIMEOUT_MS
+) -> dict[str, Any]:
     BUILD.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="coreguard-tree-", dir=str(BUILD)) as temp:
         pid_file = pathlib.Path(temp) / "pids.txt"
@@ -249,7 +276,30 @@ def run_tree_timeout(exe: pathlib.Path, timeout_ms: int = 500) -> dict[str, Any]
             raise VerificationFailure("tree timeout was not classified correctly")
         if not payload["cleanup_ok"]:
             raise VerificationFailure("tree timeout reported cleanup failure")
-        pids = wait_for_pid_file(pid_file)
+        pids = published_tree_pids(pid_file)
+        if pids is None:
+            # The kill fired before the fixture published: a precondition
+            # miss, not a containment verdict. Repeat every assertion with a
+            # stall-tolerant budget so a stalled box cannot decide the verdict.
+            payload, completed = run_coreguard(
+                exe,
+                TREE_STRESS_STALL_TIMEOUT_MS,
+                [sys.executable, str(TREE_HELPER), str(pid_file)],
+            )
+            if completed.returncode != 124 or payload["status"] != "timeout":
+                raise VerificationFailure(
+                    "tree timeout retry was not classified correctly"
+                )
+            if not payload["cleanup_ok"]:
+                raise VerificationFailure(
+                    "tree timeout retry reported cleanup failure"
+                )
+            pids = published_tree_pids(pid_file)
+            if pids is None:
+                raise VerificationFailure(
+                    "tree fixture did not publish PIDs within %d ms"
+                    % TREE_STRESS_STALL_TIMEOUT_MS
+                )
         assert_pids_gone(pids)
         return {"status": payload["status"], "pids_checked": len(pids)}
 
@@ -857,17 +907,50 @@ def run_exec_context_contract(exe: pathlib.Path) -> dict[str, Any]:
             5000,
             cwd_child,
             cwd=workdir,
-            capture_limit_bytes=64,
+            capture_limit_bytes=len(str(workdir).encode("utf-8")) + 64,
             env_clear=True,
             env=["CG_VERIFY=1"],
         )
         cases += 1
         if completed.returncode != 0 or payload["status"] != "exited":
             raise VerificationFailure("combined context run did not exit normally")
+        if payload["output_truncated"]:
+            raise VerificationFailure(
+                "combined context capture limit was smaller than the fixture cwd"
+            )
         if os.path.normcase(payload["stdout"].strip()) != os.path.normcase(
             str(workdir)
         ):
             raise VerificationFailure("combined context did not apply the cwd")
+
+        cwd_bytes = str(workdir).encode("utf-8")
+        truncating_limit = len(cwd_bytes) + 33
+        payload, completed = run_coreguard(
+            exe,
+            5000,
+            [
+                sys.executable,
+                "-c",
+                "import os, sys; sys.stdout.buffer.write("
+                "os.getcwd().encode('utf-8') + b'\\n' + b'z' * 4096)",
+            ],
+            cwd=workdir,
+            capture_limit_bytes=truncating_limit,
+            env_clear=True,
+            env=["CG_VERIFY=1"],
+        )
+        cases += 1
+        if completed.returncode != 0 or payload["status"] != "exited":
+            raise VerificationFailure("combined truncation run did not exit normally")
+        if not payload["output_truncated"]:
+            raise VerificationFailure(
+                "combined context capture limit was not enforced"
+            )
+        expected_prefix = (cwd_bytes + b"\n" + b"z" * 4096)[:truncating_limit].decode(
+            "utf-8"
+        )
+        if payload["stdout"] != expected_prefix:
+            raise VerificationFailure("combined context capture prefix was not exact")
         return {"status": "PASS", "cases": cases}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -1317,7 +1400,7 @@ def stress_case(exe: pathlib.Path, kind: str) -> None:
         if not payload["cleanup_ok"]:
             raise VerificationFailure("timeout stress case leaked cleanup")
     elif kind == "tree_timeout":
-        run_tree_timeout(exe, 100)
+        run_tree_timeout(exe)
     else:
         raise VerificationFailure("unknown stress case %s" % kind)
 
@@ -1364,6 +1447,8 @@ def run_handle_stress(exe: pathlib.Path) -> dict[str, Any]:
         "parent_handle_count_after": after,
         "parent_handle_count_samples": samples,
         "one_time_baseline_shift": after - before,
+        "tree_stress_timeout_ms": TREE_STRESS_TIMEOUT_MS,
+        "tree_stress_stall_timeout_ms": TREE_STRESS_STALL_TIMEOUT_MS,
         "measurement_limit": (
             "GetProcessHandleCount covers the Python verifier process only; "
             "per-type child/job/thread/pipe handles are not directly observable here."
