@@ -40,3 +40,21 @@ Details:
 
 - Measured the sleeping Python child's user CPU on the unchanged published line: 0-62 ms across 16 runs, 1 run tripped the 50 ms limit (identical failure mode on `origin/main`, so not a regression of this branch).
 - The child still sleeps ~1 s against a 1500 ms wall timeout; the test keeps proving that a CPU limit is not reported as a wall-clock timeout.
+
+### 2026-09-25 14:15 - Verification gate proves CPU-limit enforcement latency
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | `tests/verification.py` rejects CPU-limit runs that are only classified after natural exit or after the kernel's late end-of-job backstop |
+| Commit | `dc894be` |
+| Ergebnis | OK - pre-enforcement binary 479dbb2 now FAILs the gate (200 ms limit: 3.1-7.0 s wall, 2.6-5.0 s job CPU); fixed binary PASSes (40 samples: 214-368 ms wall, 203 ms job CPU); 122 unittest OK (2 skipped); full gate PASS, `blocked_sections: []` |
+
+Details:
+
+- Gap: `run_cpu_enforcement` and `run_job_metrics_contract` asserted classification (`returncode 123`, `resource_limit`, kind `cpu_time`, `cleanup_ok`) but no timing. On 479dbb2 the enforcing accounting poll does not exist, so a 200 ms limit was reported only after the workload finished (root) or after the kernel's periodic backstop (tree/job-metrics, ~5-7 s) while the gate still passed. Microsoft documents the job-time backstop only as a periodic check, so it must not be treated as the enforcement mechanism.
+- Change: helper `assert_prompt_cpu_enforcement(label, payload)` used by the root case, both process-tree cases and the job-metrics CPU experiment; it requires `duration_ms <= CPU_ENFORCEMENT_PROMPT_BOUND_MS` (3000, matching the shipped `test_coreguard.py` bound) and `job_metrics.total_user_cpu_ms <= CPU_ENFORCEMENT_LIMIT_MS * CPU_ENFORCEMENT_MAX_JOB_CPU_FACTOR` (8x the limit). Test-only; no product, CLI or ABI change. The CPU sections report duration and job CPU as evidence.
+- Negative controls: 479dbb2 fails with the new messages; disabling the wall bound isolates the job-CPU check (5000 ms job CPU), disabling the job-CPU check isolates the wall check (tree 5952 ms; the root run slipped below 3000 ms in that sample, which is why the accounting invariant matters); synthetic payloads exercise the helper in both directions.
+- Positive control: fixed binary 10/10 `run_cpu_enforcement` sections PASS; full gate PASS; 122 unittest cases OK (2 skipped) with `COREGUARD_VCVARS` set.
+- Deliberately unchanged: the natural-exit boundary loop (10 runs, `--burn 0.15` against a 200 ms limit) accepts both `exited` and `resource_limit`; it is a boundary fixture, not an enforcement proof, so no bound was added there.
+- Not verified: GitHub Actions (local MSVC substitute). Push/PR only on the dedicated feature branch.
