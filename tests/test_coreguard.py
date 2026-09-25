@@ -20,6 +20,11 @@ RESOURCE_HELPER = ROOT / "tests" / "helpers" / "resource_tree.py"
 CPU_HELPER = ROOT / "tests" / "helpers" / "cpu_tree.py"
 ACTIVE_HELPER = ROOT / "tests" / "helpers" / "active_process_tree.py"
 JOB_METRICS_HELPER = ROOT / "tests" / "helpers" / "job_metrics_tree.py"
+# Job-wide CPU accounting advances on scheduler ticks while a process's
+# own times are exact, so the total of a single-process job can trail the
+# root process by up to one tick. Measured with prompt enforcement at a
+# 200 ms limit: 2 of 40 runs, always exactly -15 ms (203 vs 218 ms).
+JOB_ACCOUNTING_TICK_MS = 16
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
@@ -515,7 +520,8 @@ class CoreguardTests(unittest.TestCase):
         self.assertTrue(payload["cleanup_ok"])
         self.assertGreater(self.job_metric(payload, "total_user_cpu_ms"), 0)
         self.assertGreaterEqual(
-            self.job_metric(payload, "total_user_cpu_ms"),
+            self.job_metric(payload, "total_user_cpu_ms")
+            + JOB_ACCOUNTING_TICK_MS,
             payload["metrics"]["user_cpu_ms"],
         )
         # Prompt enforcement: the helper burns for 5 s of wall time, so a run
