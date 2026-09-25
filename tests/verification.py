@@ -47,6 +47,19 @@ TREE_STRESS_TIMEOUT_MS = 300
 # alive or prevents it from ever existing still fails closed.
 TREE_STRESS_STALL_TIMEOUT_MS = 5000
 TREE_STRESS_READY_GRACE_SECONDS = 0.5
+# CPU-time limit used by every CPU-limit enforcement fixture in this runner.
+CPU_ENFORCEMENT_LIMIT_MS = 200
+# A CPU-time limit is enforced while the job runs, not merely classified after
+# a natural exit or the kernel's late end-of-job backstop. Microsoft documents
+# that backstop only as a periodic check; measured on the pre-enforcement
+# binary, a 200 ms limit consumed 3.1-7.0 s of wall time and 4.6-5.0 s of job
+# CPU before classification. Every CPU fixture here burns at least 5 s of user
+# time, so a limit-classified run below these bounds proves prompt enforcement.
+# Prompt runs measured 273-321 ms wall and 203 ms job CPU; both bounds keep
+# more than 7x margin over that and match the shipped test_coreguard.py
+# enforcement bound.
+CPU_ENFORCEMENT_PROMPT_BOUND_MS = 3000
+CPU_ENFORCEMENT_MAX_JOB_CPU_FACTOR = 8
 
 
 class VerificationFailure(RuntimeError):
@@ -454,6 +467,23 @@ def run_resource_enforcement(exe: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def assert_prompt_cpu_enforcement(label: str, payload: dict[str, Any]) -> None:
+    """Prove a limit-classified run was ended by the limit while it ran."""
+    duration_ms = payload["duration_ms"]
+    if duration_ms > CPU_ENFORCEMENT_PROMPT_BOUND_MS:
+        raise VerificationFailure(
+            "%s was classified but not enforced while the job ran: "
+            "duration_ms=%d limit_ms=%d"
+            % (label, duration_ms, CPU_ENFORCEMENT_LIMIT_MS)
+        )
+    job_cpu_ms = payload["job_metrics"]["total_user_cpu_ms"]
+    if job_cpu_ms > CPU_ENFORCEMENT_LIMIT_MS * CPU_ENFORCEMENT_MAX_JOB_CPU_FACTOR:
+        raise VerificationFailure(
+            "%s consumed %d ms of job CPU for a %d ms limit"
+            % (label, job_cpu_ms, CPU_ENFORCEMENT_LIMIT_MS)
+        )
+
+
 def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
     cases = 0
     below_payload, below_completed = run_coreguard(
@@ -475,7 +505,7 @@ def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
         exe,
         10000,
         [sys.executable, str(CPU_HELPER), "--burn", "5"],
-        cpu_time_limit_ms=200,
+        cpu_time_limit_ms=CPU_ENFORCEMENT_LIMIT_MS,
     )
     cases += 1
     if (
@@ -486,6 +516,7 @@ def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
         or not root_payload["cleanup_ok"]
     ):
         raise VerificationFailure("root CPU limit was not enforced/classified")
+    assert_prompt_cpu_enforcement("root CPU limit", root_payload)
 
     sleeper_payload, sleeper_completed = run_coreguard(
         exe,
@@ -511,7 +542,7 @@ def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
                 exe,
                 10000,
                 [sys.executable, str(CPU_HELPER), mode, str(pid_file), "5"],
-                cpu_time_limit_ms=200,
+                cpu_time_limit_ms=CPU_ENFORCEMENT_LIMIT_MS,
             )
             cases += 1
             if (
@@ -522,9 +553,19 @@ def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
                 or payload["metrics_scope"] != "process"
             ):
                 raise VerificationFailure("CPU process-tree case was not bounded")
+            assert_prompt_cpu_enforcement(
+                "CPU process-tree case %s" % mode, payload
+            )
             pids = wait_for_pid_file(pid_file, expected_count)
             assert_pids_gone(pids)
-            tree_results.append({"mode": mode, "pids_checked": len(pids)})
+            tree_results.append(
+                {
+                    "mode": mode,
+                    "pids_checked": len(pids),
+                    "duration_ms": payload["duration_ms"],
+                    "job_user_cpu_ms": payload["job_metrics"]["total_user_cpu_ms"],
+                }
+            )
 
     timeout_payload, timeout_completed = run_coreguard(
         exe,
@@ -569,7 +610,7 @@ def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
             exe,
             5000,
             [sys.executable, str(CPU_HELPER), "--burn", "0.15"],
-            cpu_time_limit_ms=200,
+            cpu_time_limit_ms=CPU_ENFORCEMENT_LIMIT_MS,
         )
         cases += 1
         if completed.returncode not in (0, 123) or payload["status"] not in (
@@ -591,6 +632,8 @@ def run_cpu_enforcement(exe: pathlib.Path) -> dict[str, Any]:
         "scope": "job",
         "unit": "milliseconds public, Windows 100-nanosecond user-mode ticks",
         "root": root_payload["status"],
+        "root_duration_ms": root_payload["duration_ms"],
+        "root_job_user_cpu_ms": root_payload["job_metrics"]["total_user_cpu_ms"],
         "below_limit": below_payload["status"],
         "sleeper": sleeper_payload["status"],
         "tree": tree_results,
@@ -1214,7 +1257,7 @@ def run_job_metrics_contract(exe: pathlib.Path) -> dict[str, Any]:
             exe,
             10000,
             [sys.executable, str(CPU_HELPER), "--spawn-child", str(cpu_limit_report), "5"],
-            cpu_time_limit_ms=200,
+            cpu_time_limit_ms=CPU_ENFORCEMENT_LIMIT_MS,
         )
         if (
             cpu_limit_completed.returncode != 123
@@ -1224,7 +1267,19 @@ def run_job_metrics_contract(exe: pathlib.Path) -> dict[str, Any]:
             < require_metric(cpu_limit_payload, "user_cpu_ms")
         ):
             raise VerificationFailure("CPU-limit metrics changed primary classification")
-        experiments.append({"name": "CPU-limit interaction", "status": "PASS"})
+        assert_prompt_cpu_enforcement(
+            "CPU-limit metrics interaction", cpu_limit_payload
+        )
+        experiments.append(
+            {
+                "name": "CPU-limit interaction",
+                "status": "PASS",
+                "duration_ms": cpu_limit_payload["duration_ms"],
+                "job_user_cpu_ms": cpu_limit_payload["job_metrics"][
+                    "total_user_cpu_ms"
+                ],
+            }
+        )
 
         memory_limit_report = directory / "memory-limit.txt"
         memory_limit_payload, memory_limit_completed = run_coreguard(
