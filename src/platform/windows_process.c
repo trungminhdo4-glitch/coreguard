@@ -14,6 +14,13 @@
 
 #define CG_MAX_COMMAND_LINE 32767U
 #define CG_TIMEOUT_GRACE_MS 5000U
+/* Anonymous pipe buffer requested for bounded stdin delivery. A single
+   WriteFile of at most the requested buffer size cannot block, so the payload
+   bound stays strictly below it (see the static assertion below). */
+#define CG_STDIN_PIPE_BUFFER_BYTES (1024U * 128U)
+
+_Static_assert(CG_STDIN_MAX_BYTES < CG_STDIN_PIPE_BUFFER_BYTES,
+               "Coreguard requires stdin payloads to fit the pipe buffer");
 #define CG_RESOURCE_POLL_MS 5U
 #define CG_RESOURCE_TERMINATION_CODE 123U
 #define CG_WAIT_RESOURCE 0x10000U
@@ -349,42 +356,22 @@ static DWORD cg_wait_for_process(HANDLE process, HANDLE completion_port,
         }
 
         remaining = deadline - now;
-        wait_ms = poll_completion_port && remaining > CG_RESOURCE_POLL_MS
+        wait_ms = remaining > CG_RESOURCE_POLL_MS
                       ? CG_RESOURCE_POLL_MS
                       : (DWORD)remaining;
         if (wait_ms == 0U) {
             wait_ms = 1U;
         }
-        if (!poll_completion_port && cpu_time_limit_ticks != 0U) {
-            HANDLE wait_handles[3];
-            DWORD handle_count = 2U;
-            wait_handles[0] = process;
-            wait_handles[1] = job;
-            if (output_failure_event != NULL) {
-                wait_handles[handle_count++] = output_failure_event;
-            }
-            wait_result = WaitForMultipleObjects(handle_count, wait_handles,
-                                                 FALSE, wait_ms);
-            if (wait_result == WAIT_OBJECT_0 + 1U) {
-                *resource_flags |= CG_RESOURCE_FLAG_CPU_TIME;
-                return CG_WAIT_RESOURCE;
-            }
-            if (output_failure_event != NULL &&
-                wait_result == WAIT_OBJECT_0 + 2U) {
-                return CG_WAIT_OUTPUT;
-            }
+        if (output_failure_event == NULL) {
+            wait_result = WaitForSingleObject(process, wait_ms);
         } else {
-            if (output_failure_event == NULL) {
-                wait_result = WaitForSingleObject(process, wait_ms);
-            } else {
-                HANDLE wait_handles[2];
-                wait_handles[0] = process;
-                wait_handles[1] = output_failure_event;
-                wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
-                                                     wait_ms);
-                if (wait_result == WAIT_OBJECT_0 + 1U) {
-                    return CG_WAIT_OUTPUT;
-                }
+            HANDLE wait_handles[2];
+            wait_handles[0] = process;
+            wait_handles[1] = output_failure_event;
+            wait_result = WaitForMultipleObjects(2, wait_handles, FALSE,
+                                                 wait_ms);
+            if (wait_result == WAIT_OBJECT_0 + 1U) {
+                return CG_WAIT_OUTPUT;
             }
         }
         if (wait_result == WAIT_FAILED) {
@@ -1315,6 +1302,52 @@ static void cg_close_child_handle(HANDLE source, HANDLE child_handle)
     }
 }
 
+static int cg_stdin_pipe_create(HANDLE *read_out, HANDLE *write_out,
+                                DWORD *error_out)
+{
+    SECURITY_ATTRIBUTES attributes;
+    HANDLE read_handle = NULL;
+    HANDLE write_handle = NULL;
+
+    *read_out = NULL;
+    *write_out = NULL;
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = NULL;
+    attributes.bInheritHandle = TRUE;
+    if (!CreatePipe(&read_handle, &write_handle, &attributes,
+                    CG_STDIN_PIPE_BUFFER_BYTES)) {
+        *error_out = GetLastError();
+        return 0;
+    }
+    if (!SetHandleInformation(write_handle, HANDLE_FLAG_INHERIT, 0)) {
+        *error_out = GetLastError();
+        CloseHandle(read_handle);
+        CloseHandle(write_handle);
+        return 0;
+    }
+    *read_out = read_handle;
+    *write_out = write_handle;
+    return 1;
+}
+
+static int cg_stdin_write(HANDLE write_handle, const void *data, size_t size,
+                          DWORD *error_out)
+{
+    DWORD written = 0U;
+
+    /* The payload fits the pipe buffer, so this single write cannot block even
+       when the child never reads; the child is still suspended here. */
+    if (!WriteFile(write_handle, data, (DWORD)size, &written, NULL)) {
+        *error_out = GetLastError();
+        return 0;
+    }
+    if ((size_t)written != size) {
+        *error_out = ERROR_WRITE_FAULT;
+        return 0;
+    }
+    return 1;
+}
+
 static int cg_terminate_unassigned_process(HANDLE process,
                                             cg_run_result *result)
 {
@@ -1375,6 +1408,7 @@ static int cg_windows_run_internal(
     HANDLE stdin_handle;
     HANDLE stdout_handle;
     HANDLE stderr_handle;
+    HANDLE stdin_write_handle;
     HANDLE child_stdin_handle;
     HANDLE child_stdout_handle;
     HANDLE child_stderr_handle;
@@ -1400,6 +1434,8 @@ static int cg_windows_run_internal(
     const cg_resource_limits *resource_limits = options->resource_limits;
     const wchar_t *working_directory;
     const wchar_t *environment_block;
+    const void *stdin_data;
+    size_t stdin_size;
     size_t capture_prefix;
 
     cg_capture_reap_quarantined();
@@ -1419,6 +1455,7 @@ static int cg_windows_run_internal(
     command_line.data = NULL;
     command_line.length = 0;
     command_line.capacity = 0;
+    stdin_write_handle = NULL;
     child_stdin_handle = NULL;
     child_stdout_handle = NULL;
     child_stderr_handle = NULL;
@@ -1437,6 +1474,8 @@ static int cg_windows_run_internal(
         cg_active_process_limit_enabled(resource_limits);
     working_directory = context != NULL ? context->working_directory : NULL;
     environment_block = context != NULL ? context->environment_block : NULL;
+    stdin_data = context != NULL ? context->stdin_data : NULL;
+    stdin_size = context != NULL ? context->stdin_size : 0U;
     capture_prefix = context != NULL && context->capture_prefix_bytes != 0U
                          ? context->capture_prefix_bytes
                          : (size_t)CG_CAPTURE_PREFIX_DEFAULT_BYTES;
@@ -1492,9 +1531,7 @@ static int cg_windows_run_internal(
         result->status = CG_STATUS_CONTAINMENT_FAILED;
         goto cleanup;
     }
-    poll_completion_port =
-        memory_limit_enabled ||
-        (cpu_time_limit_enabled && completion_port != NULL);
+    poll_completion_port = memory_limit_enabled || cpu_time_limit_enabled;
     if (options->capture_output) {
         if (!cg_capture_create(&stdout_capture, capture_prefix, &last_error) ||
             !cg_capture_create(&stderr_capture, capture_prefix, &last_error)) {
@@ -1525,9 +1562,20 @@ static int cg_windows_run_internal(
                                              : GetStdHandle(STD_OUTPUT_HANDLE);
     stderr_handle = options->capture_output ? stderr_capture->write_handle
                                              : GetStdHandle(STD_ERROR_HANDLE);
-    if (!cg_duplicate_child_handle(stdin_handle, &child_stdin_handle,
-                                   &last_error) ||
-        !cg_duplicate_child_handle(stdout_handle, &child_stdout_handle,
+    if (stdin_data != NULL) {
+        if (!cg_stdin_pipe_create(&child_stdin_handle, &stdin_write_handle,
+                                  &last_error)) {
+            cg_set_error(result, last_error);
+            result->status = CG_STATUS_START_FAILED;
+            goto cleanup;
+        }
+    } else if (!cg_duplicate_child_handle(stdin_handle, &child_stdin_handle,
+                                          &last_error)) {
+        cg_set_error(result, last_error);
+        result->status = CG_STATUS_START_FAILED;
+        goto cleanup;
+    }
+    if (!cg_duplicate_child_handle(stdout_handle, &child_stdout_handle,
                                    &last_error) ||
         !cg_duplicate_child_handle(stderr_handle, &child_stderr_handle,
                                    &last_error)) {
@@ -1649,6 +1697,18 @@ static int cg_windows_run_internal(
             (void)cg_terminate_job(job, process, result, 125U);
             goto cleanup;
         }
+    }
+    if (stdin_write_handle != NULL) {
+        if (!cg_stdin_write(stdin_write_handle, stdin_data, stdin_size,
+                            &last_error)) {
+            cg_set_error(result, last_error);
+            result->status = CG_STATUS_INTERNAL_ERROR;
+            result->cleanup_ok = 0;
+            (void)cg_terminate_job(job, process, result, 125U);
+            goto cleanup;
+        }
+        CloseHandle(stdin_write_handle);
+        stdin_write_handle = NULL;
     }
     if (ResumeThread(thread) == (DWORD)-1) {
         cg_set_error(result, GetLastError());
@@ -1775,6 +1835,10 @@ cleanup:
     cg_close_child_handle(stdin_handle, child_stdin_handle);
     cg_close_child_handle(stdout_handle, child_stdout_handle);
     cg_close_child_handle(stderr_handle, child_stderr_handle);
+    if (stdin_write_handle != NULL) {
+        CloseHandle(stdin_write_handle);
+        stdin_write_handle = NULL;
+    }
     if (stdout_capture != NULL &&
         !cg_capture_close_write(stdout_capture, &last_error) &&
         capture_output_available) {

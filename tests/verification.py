@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import hashlib
 import json
 import os
 import pathlib
@@ -67,6 +68,7 @@ def run_coreguard(
     env_clear: bool = False,
     env: list[str] | None = None,
     capture_limit_bytes: int | None = None,
+    stdin_file: pathlib.Path | None = None,
 ) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
     runner = [str(exe), "run", "--json", "--timeout-ms", str(timeout_ms)]
     if memory_limit_mb is not None:
@@ -83,6 +85,8 @@ def run_coreguard(
         runner.extend(["--env", entry])
     if capture_limit_bytes is not None:
         runner.extend(["--capture-limit-bytes", str(capture_limit_bytes)])
+    if stdin_file is not None:
+        runner.extend(["--stdin-file", str(stdin_file)])
     runner.extend(["--", *command])
     try:
         completed = subprocess.run(
@@ -868,6 +872,49 @@ def run_exec_context_contract(exe: pathlib.Path) -> dict[str, Any]:
             str(workdir)
         ):
             raise VerificationFailure("combined context did not apply the cwd")
+
+        stdin_payload = bytes(range(256)) * 16
+        stdin_path = workdir / "stdin-payload.bin"
+        stdin_path.write_bytes(stdin_payload)
+        payload, completed = run_coreguard(
+            exe,
+            5000,
+            [
+                sys.executable,
+                "-c",
+                "import sys, hashlib; d = sys.stdin.buffer.read(); "
+                "print(len(d), hashlib.sha256(d).hexdigest())",
+            ],
+            stdin_file=stdin_path,
+        )
+        cases += 1
+        if completed.returncode != 0 or payload["status"] != "exited":
+            raise VerificationFailure("stdin context run did not exit normally")
+        observed = payload["stdout"].split()
+        if observed != [
+            str(len(stdin_payload)),
+            hashlib.sha256(stdin_payload).hexdigest(),
+        ]:
+            raise VerificationFailure("child did not receive the exact stdin payload")
+
+        stdin_max_path = workdir / "stdin-max.bin"
+        stdin_max_path.write_bytes(b"s" * (64 * 1024))
+        started = time.monotonic()
+        payload, completed = run_coreguard(
+            exe,
+            5000,
+            ["cmd.exe", "/d", "/c", "exit 0"],
+            stdin_file=stdin_max_path,
+        )
+        cases += 1
+        if (
+            completed.returncode != 0
+            or payload["status"] != "exited"
+            or time.monotonic() - started > 10.0
+        ):
+            raise VerificationFailure(
+                "maximum stdin payload with a non-reading child did not complete"
+            )
         return {"status": "PASS", "cases": cases}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

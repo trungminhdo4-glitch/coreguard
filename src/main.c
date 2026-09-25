@@ -18,7 +18,8 @@ static void print_usage(FILE *stream)
             "Usage: coreguard run [--json] [--timeout-ms N] "
             "[--memory-limit-mb N] [--cpu-time-limit-ms N] "
             "[--max-processes N] [--cwd DIR] [--env-clear] "
-            "[--env NAME=VALUE] [--capture-limit-bytes N] -- command args...\n"
+            "[--env NAME=VALUE] [--capture-limit-bytes N] "
+            "[--stdin-file PATH] -- command args...\n"
             "       coreguard --help\n\n"
             "Runs one executable directly and contains it in a Windows Job Object.\n"
             "--memory-limit-mb applies to the complete controlled process tree.\n"
@@ -28,7 +29,9 @@ static void print_usage(FILE *stream)
             "--env-clear starts an empty child environment; --env adds or overrides\n"
             "  one NAME=VALUE entry (repeatable; names match case-insensitively).\n"
             "--capture-limit-bytes bounds the retained capture prefix per stream\n"
-            "  and requires --json.\n");
+            "  and requires --json.\n"
+            "--stdin-file feeds a bounded payload (at most 64 KiB) to the child\n"
+            "  stdin and then closes it; the default inherits the caller's stdin.\n");
 }
 
 typedef struct cg_env_pool {
@@ -223,6 +226,43 @@ done:
         out->parent = NULL;
     }
     return ok;
+}
+
+static int cg_stdin_file_read(const wchar_t *path, void **data_out,
+                              size_t *size_out)
+{
+    HANDLE file;
+    LARGE_INTEGER size;
+    void *data;
+    DWORD read = 0U;
+
+    *data_out = NULL;
+    *size_out = 0U;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        size.QuadPart > (LONGLONG)CG_STDIN_MAX_BYTES) {
+        CloseHandle(file);
+        return 0;
+    }
+    data = malloc((size_t)size.QuadPart);
+    if (data == NULL) {
+        CloseHandle(file);
+        return 0;
+    }
+    if (!ReadFile(file, data, (DWORD)size.QuadPart, &read, NULL) ||
+        (size_t)read != (size_t)size.QuadPart) {
+        free(data);
+        CloseHandle(file);
+        return 0;
+    }
+    CloseHandle(file);
+    *data_out = data;
+    *size_out = (size_t)read;
+    return 1;
 }
 
 static void cg_env_block_release(cg_env_block *env)
@@ -600,6 +640,9 @@ int wmain(int argc, wchar_t **argv)
     int env_clear = 0;
     int capture_limit_set = 0;
     const wchar_t *cwd = NULL;
+    const wchar_t *stdin_file = NULL;
+    void *stdin_data = NULL;
+    size_t stdin_size = 0U;
     uint64_t capture_limit = 0;
     cg_resource_limits resource_limits = {0};
     cg_env_pool env_overrides = {0};
@@ -683,6 +726,12 @@ int wmain(int argc, wchar_t **argv)
                 goto usage_error;
             }
             capture_limit_set = 1;
+        } else if (wcscmp(argv[i], L"--stdin-file") == 0 && i + 1 < argc) {
+            if (stdin_file != NULL || argv[i + 1][0] == L'\0') {
+                fprintf(stderr, "coreguard: invalid --stdin-file\n");
+                goto usage_error;
+            }
+            stdin_file = argv[++i];
         } else {
             fprintf(stderr, "coreguard: unknown or incomplete option\n");
             goto usage_error;
@@ -704,6 +753,11 @@ int wmain(int argc, wchar_t **argv)
         }
     }
     cg_env_pool_release(&env_overrides);
+    if (stdin_file != NULL &&
+        !cg_stdin_file_read(stdin_file, &stdin_data, &stdin_size)) {
+        fprintf(stderr, "coreguard: invalid --stdin-file\n");
+        goto usage_error;
+    }
 
     options.argv = (const wchar_t *const *)&argv[separator + 1];
     options.argc = (size_t)(argc - separator - 1);
@@ -713,12 +767,15 @@ int wmain(int argc, wchar_t **argv)
                                active_process_limit_set)
                                   ? &resource_limits
                                   : NULL;
-    if (cwd != NULL || env_block.block != NULL || capture_limit_set) {
+    if (cwd != NULL || env_block.block != NULL || capture_limit_set ||
+        stdin_data != NULL) {
         context.working_directory = cwd;
         context.environment_block = env_block.block;
         context.environment_block_chars = env_block.chars;
         context.capture_prefix_bytes =
             capture_limit_set ? (size_t)capture_limit : 0U;
+        context.stdin_data = stdin_data;
+        context.stdin_size = stdin_size;
         context_ptr = &context;
     }
     if (json) {
@@ -733,6 +790,7 @@ int wmain(int argc, wchar_t **argv)
     if (rc != 0) {
         fprintf(stderr, "coreguard: internal API failure\n");
         cg_env_block_release(&env_block);
+        free(stdin_data);
         return CG_INTERNAL_EXIT_CODE;
     }
     if (json) {
@@ -756,9 +814,12 @@ int wmain(int argc, wchar_t **argv)
     }
     cg_run_result_free(&result);
     cg_env_block_release(&env_block);
+    free(stdin_data);
     return rc;
 
 usage_error:
     cg_env_pool_release(&env_overrides);
+    cg_env_block_release(&env_block);
+    free(stdin_data);
     return 2;
 }

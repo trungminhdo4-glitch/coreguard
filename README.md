@@ -109,6 +109,9 @@ behaves exactly like `cg_run`. `cg_exec_context` carries:
   unchanged and does not sort or validate values.
 - `capture_prefix_bytes`, the retained capture prefix per stream; zero selects
   the default of 1 MiB and values above 1 GiB are rejected.
+- `stdin_data` with `stdin_size`, a bounded stdin payload of at most 64 KiB
+  delivered on a pipe and closed with end-of-file; `NULL` inherits the caller's
+  stdin.
 
 Structurally invalid context values (an empty working directory, a block that is
 not exactly double-NUL terminated, an environment size without a block, an
@@ -144,7 +147,7 @@ coreguard run [--json] [--timeout-ms N]
               [--cpu-time-limit-ms N]
               [--max-processes N]
               [--cwd DIR] [--env-clear] [--env NAME=VALUE]
-              [--capture-limit-bytes N] -- command args...
+              [--capture-limit-bytes N] [--stdin-file PATH] -- command args...
 ```
 
 `--json` reports the exit status, timeout/resource classification, bounded
@@ -179,6 +182,10 @@ guarantee.
   silently winning, and the resulting block is sorted as Win32 expects.
 - `--capture-limit-bytes N` bounds the retained capture prefix per stream and
   requires `--json`.
+- `--stdin-file PATH` feeds the file's raw bytes (at most 64 KiB) to the child
+  stdin and then closes it; the default inherits the caller's stdin. The
+  payload is written before the child is resumed and fits the pipe buffer, so
+  it can never deadlock against a child that does not read.
 
 The same behavior is available through `cg_run_ex`. Values are passed through
 unchanged; Coreguard does not expand environment variables or validate value

@@ -39,6 +39,43 @@ static int parse_positive_u64(const wchar_t *text, uint64_t *value_out)
     return 1;
 }
 
+static int read_stdin_file(const wchar_t *path, void **data_out,
+                           size_t *size_out)
+{
+    HANDLE file;
+    LARGE_INTEGER size;
+    void *data;
+    DWORD read = 0U;
+
+    *data_out = NULL;
+    *size_out = 0U;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        size.QuadPart > (LONGLONG)CG_STDIN_MAX_BYTES) {
+        CloseHandle(file);
+        return 0;
+    }
+    data = malloc((size_t)size.QuadPart);
+    if (data == NULL) {
+        CloseHandle(file);
+        return 0;
+    }
+    if (!ReadFile(file, data, (DWORD)size.QuadPart, &read, NULL) ||
+        (size_t)read != (size_t)size.QuadPart) {
+        free(data);
+        CloseHandle(file);
+        return 0;
+    }
+    CloseHandle(file);
+    *data_out = data;
+    *size_out = (size_t)read;
+    return 1;
+}
+
 static void print_result(const cg_run_result *result)
 {
     printf("api=0\n");
@@ -67,6 +104,7 @@ int wmain(int argc, wchar_t **argv)
     cg_exec_context context = {0};
     const cg_exec_context *context_ptr = NULL;
     cg_run_result result = {0};
+    void *stdin_buffer = NULL;
     const wchar_t *mode;
     int rc;
 
@@ -117,6 +155,21 @@ int wmain(int argc, wchar_t **argv)
     } else if (wcscmp(mode, L"limit-over-max") == 0) {
         context.capture_prefix_bytes = (size_t)CG_CAPTURE_PREFIX_MAX_BYTES + 1U;
         context_ptr = &context;
+    } else if (wcsncmp(mode, L"stdin-file:", 11) == 0) {
+        if (!read_stdin_file(mode + 11, &stdin_buffer, &context.stdin_size)) {
+            fprintf(stderr, "invalid stdin file\n");
+            return 2;
+        }
+        context.stdin_data = stdin_buffer;
+        context_ptr = &context;
+    } else if (wcscmp(mode, L"stdin-mismatch") == 0) {
+        context.stdin_data = "x";
+        context.stdin_size = 0U;
+        context_ptr = &context;
+    } else if (wcscmp(mode, L"stdin-over-max") == 0) {
+        context.stdin_data = "x";
+        context.stdin_size = (size_t)CG_STDIN_MAX_BYTES + 1U;
+        context_ptr = &context;
     } else {
         fprintf(stderr, "unknown mode\n");
         return 2;
@@ -129,5 +182,6 @@ int wmain(int argc, wchar_t **argv)
     }
     print_result(&result);
     cg_run_result_free(&result);
+    free(stdin_buffer);
     return 0;
 }

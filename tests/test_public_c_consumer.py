@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -287,12 +288,14 @@ class PublicConsumerTests(unittest.TestCase):
                 "alignof(cg_resource_limits)": "8",
                 "sizeof(cg_run_options)": "40",
                 "offsetof(cg_run_options,resource_limits)": "32",
-                "sizeof(cg_exec_context)": "32",
+                "sizeof(cg_exec_context)": "48",
                 "alignof(cg_exec_context)": "8",
                 "offsetof(cg_exec_context,working_directory)": "0",
                 "offsetof(cg_exec_context,environment_block)": "8",
                 "offsetof(cg_exec_context,environment_block_chars)": "16",
                 "offsetof(cg_exec_context,capture_prefix_bytes)": "24",
+                "offsetof(cg_exec_context,stdin_data)": "32",
+                "offsetof(cg_exec_context,stdin_size)": "40",
                 "sizeof(cg_process_metrics)": "80",
                 "sizeof(cg_job_metrics)": "104",
                 "alignof(cg_job_metrics)": "8",
@@ -441,12 +444,36 @@ class PublicConsumerTests(unittest.TestCase):
             self.assertEqual(fields["output_truncated"], "1")
             self.assertEqual(captured, "x" * 64)
 
+            with tempfile.TemporaryDirectory(
+                prefix="cg-consumer-stdin-"
+            ) as stdin_temp:
+                stdin_payload = bytes(range(256)) * 8
+                stdin_path = pathlib.Path(stdin_temp) / "payload.bin"
+                stdin_path.write_bytes(stdin_payload)
+                fields, captured = probe(
+                    f"stdin-file:{stdin_path}",
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys, hashlib; d = sys.stdin.buffer.read(); "
+                        "print(len(d), hashlib.sha256(d).hexdigest())",
+                    ],
+                )
+                self.assertEqual(fields["status"], "exited")
+                observed = captured.split()
+                self.assertEqual(observed[0], str(len(stdin_payload)))
+                self.assertEqual(
+                    observed[1], hashlib.sha256(stdin_payload).hexdigest()
+                )
+
             for mode in (
                 "env-bad-termination",
                 "env-bad-interior",
                 "chars-without-block",
                 "cwd-empty",
                 "limit-over-max",
+                "stdin-mismatch",
+                "stdin-over-max",
             ):
                 with self.subTest(mode=mode):
                     fields, _ = probe(mode, echo_child)

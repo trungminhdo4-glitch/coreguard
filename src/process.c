@@ -119,6 +119,14 @@ static int cg_exec_context_valid(const cg_exec_context *context)
     if (context->capture_prefix_bytes > (size_t)CG_CAPTURE_PREFIX_MAX_BYTES) {
         return 0;
     }
+    if (context->stdin_data == NULL) {
+        if (context->stdin_size != 0U) {
+            return 0;
+        }
+    } else if (context->stdin_size == 0U ||
+               context->stdin_size > (size_t)CG_STDIN_MAX_BYTES) {
+        return 0;
+    }
     return 1;
 }
 
