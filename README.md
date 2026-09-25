@@ -97,11 +97,31 @@ int main(void)
 must be linked with a matching MSVC runtime configuration. There is no DLL or
 import-library contract.
 
+The optional `cg_run_ex` and `cg_run_ex_with_job_metrics` variants add an
+execution context without changing the existing contract. A `NULL` context
+behaves exactly like `cg_run`. `cg_exec_context` carries:
+
+- `working_directory`, passed as the child's current directory; `NULL` inherits
+  the caller's directory.
+- `environment_block` with `environment_block_chars`, a complete UTF-16
+  environment block (entries each NUL-terminated, ending in a double NUL); `NULL`
+  inherits the caller's environment. Coreguard passes the block through
+  unchanged and does not sort or validate values.
+- `capture_prefix_bytes`, the retained capture prefix per stream; zero selects
+  the default of 1 MiB and values above 1 GiB are rejected.
+
+Structurally invalid context values (an empty working directory, a block that is
+not exactly double-NUL terminated, an environment size without a block, an
+oversized capture prefix) are rejected as `CG_STATUS_USAGE_ERROR` before any
+process is created.
+
 Captured stdout and stderr are bounded independently. Coreguard retains the
-first 1 MiB of raw bytes from each stream while continuously draining and
-discarding excess bytes; `output_truncated` is set when either stream exceeds
-that limit. CR and CRLF newline normalization is applied after the raw-byte
-limit, so a returned stream can be smaller than its retained raw prefix.
+first 1 MiB of raw bytes from each stream by default while continuously
+draining and discarding excess bytes; `cg_run_ex` and `--capture-limit-bytes`
+select a different prefix up to 1 GiB. `output_truncated` is set when either
+stream exceeds its limit. CR and CRLF newline normalization is applied after
+the raw-byte limit, so a returned stream can be smaller than its retained raw
+prefix.
 
 After the controlled job exits, capture readers get a short drain period.
 Coreguard then repeatedly signals them to stop, cancels synchronous reads, and
@@ -122,7 +142,9 @@ it does not insert `cmd.exe` between Coreguard and the requested executable.
 coreguard run [--json] [--timeout-ms N]
               [--memory-limit-mb N]
               [--cpu-time-limit-ms N]
-              [--max-processes N] -- command args...
+              [--max-processes N]
+              [--cwd DIR] [--env-clear] [--env NAME=VALUE]
+              [--capture-limit-bytes N] -- command args...
 ```
 
 `--json` reports the exit status, timeout/resource classification, bounded
@@ -144,6 +166,23 @@ metrics where Windows provides them. Validity masks distinguish a measured
 zero from an unavailable native value. CPU values are CPU time, not CPU
 utilization; memory enforcement is not a private-byte or general sandbox
 guarantee.
+
+## Execution context
+
+- `--cwd DIR` sets the child working directory; the default inherits the
+  caller's current directory. A directory that does not exist fails the start
+  with `start_failed` and the native `win32_error`.
+- `--env-clear` starts from an empty child environment.
+- `--env NAME=VALUE` adds or overrides one entry and may be repeated. Without
+  `--env-clear` the entries are merged over the caller's environment;
+  names match case-insensitively, the last duplicate is rejected instead of
+  silently winning, and the resulting block is sorted as Win32 expects.
+- `--capture-limit-bytes N` bounds the retained capture prefix per stream and
+  requires `--json`.
+
+The same behavior is available through `cg_run_ex`. Values are passed through
+unchanged; Coreguard does not expand environment variables or validate value
+contents.
 
 ## Known limitations
 

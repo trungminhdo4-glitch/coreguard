@@ -52,6 +52,36 @@ typedef struct cg_run_options {
     const cg_resource_limits *resource_limits;
 } cg_run_options;
 
+/* Retained capture prefix per stream when capture_prefix_bytes is zero. */
+#define CG_CAPTURE_PREFIX_DEFAULT_BYTES (UINT32_C(1024) * UINT32_C(1024))
+/* Largest accepted capture_prefix_bytes value. */
+#define CG_CAPTURE_PREFIX_MAX_BYTES \
+    (UINT32_C(1024) * UINT32_C(1024) * UINT32_C(1024))
+/* Largest accepted working_directory length in wchar_t elements. */
+#define CG_WORKDIR_MAX_CHARS UINT32_C(32767)
+
+typedef struct cg_exec_context {
+    /* Child working directory passed as lpCurrentDirectory. NULL inherits the
+       caller's current directory. A non-NULL value must be non-empty and
+       NUL-terminated within CG_WORKDIR_MAX_CHARS elements. */
+    const wchar_t *working_directory;
+    /* Complete UTF-16 environment block: KEY=VALUE entries, each terminated by
+       a NUL, followed by one final NUL (the block ends in a double NUL). NULL
+       inherits the caller's environment. Win32 documents an alphabetically
+       sorted block; Coreguard passes the block through unchanged and does not
+       sort or filter it. */
+    const wchar_t *environment_block;
+    /* Number of wchar_t elements in environment_block including the final NUL.
+       Required when environment_block is non-NULL, and must be zero
+       otherwise. */
+    size_t environment_block_chars;
+    /* Retained capture prefix per stream in bytes; zero selects
+       CG_CAPTURE_PREFIX_DEFAULT_BYTES. Values above
+       CG_CAPTURE_PREFIX_MAX_BYTES are rejected. Ignored unless the run
+       options enable output capture. */
+    size_t capture_prefix_bytes;
+} cg_exec_context;
+
 #define CG_PROCESS_METRIC_CREATION_TIME UINT32_C(1)
 #define CG_PROCESS_METRIC_USER_CPU_TIME UINT32_C(2)
 #define CG_PROCESS_METRIC_KERNEL_CPU_TIME UINT32_C(4)
@@ -173,6 +203,10 @@ CG_ABI_STATIC_ASSERT(sizeof(cg_run_options) == 40,
                      "Coreguard requires default x64 options layout");
 CG_ABI_STATIC_ASSERT(offsetof(cg_run_options, resource_limits) == 32,
                      "Coreguard requires the x64 resource_limits offset");
+CG_ABI_STATIC_ASSERT(sizeof(cg_exec_context) == 32,
+                     "Coreguard requires default x64 exec context layout");
+CG_ABI_STATIC_ASSERT(CG_ABI_ALIGNOF(cg_exec_context) == 8,
+                     "Coreguard requires default x64 exec context alignment");
 CG_ABI_STATIC_ASSERT(sizeof(cg_process_metrics) == 80,
                      "Coreguard requires default x64 process metrics layout");
 CG_ABI_STATIC_ASSERT(sizeof(cg_job_metrics) == 104,
@@ -197,6 +231,15 @@ int cg_run(const cg_run_options *options, cg_run_result *result);
 int cg_run_with_job_metrics(const cg_run_options *options,
                             cg_run_result *result,
                             cg_job_metrics *job_metrics);
+/* Run variant with an optional execution context (working directory,
+   environment block, capture prefix). A NULL context behaves exactly like
+   cg_run; invalid context values are rejected as CG_STATUS_USAGE_ERROR. */
+int cg_run_ex(const cg_run_options *options, const cg_exec_context *context,
+              cg_run_result *result);
+int cg_run_ex_with_job_metrics(const cg_run_options *options,
+                               const cg_exec_context *context,
+                               cg_run_result *result,
+                               cg_job_metrics *job_metrics);
 void cg_run_result_free(cg_run_result *result);
 const char *cg_status_name(cg_status status);
 

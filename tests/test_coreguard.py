@@ -520,10 +520,15 @@ class CoreguardTests(unittest.TestCase):
         )
 
     def test_cpu_limit_is_not_wall_clock_timeout(self) -> None:
+        # Python startup alone can consume 30-60ms of user CPU on a loaded
+        # host (measured on the published line: 1/16 runs exceeded a 50ms
+        # job limit while sleeping), so keep a wide margin between startup
+        # CPU and the limit while the child still sleeps far below the wall
+        # timeout.
         payload, completed = self.run_json(
             1500,
             [sys.executable, "-c", "import time; time.sleep(1)"],
-            cpu_time_limit_ms=50,
+            cpu_time_limit_ms=500,
         )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(payload["status"], "exited")
@@ -1130,6 +1135,28 @@ class CoreguardTests(unittest.TestCase):
         self.assertTrue(payload["job_metrics"]["snapshot_available"])
         self.assertGreaterEqual(self.job_metric(payload, "total_processes"), 2)
         self.assertGreaterEqual(self.job_metric(payload, "active_processes"), 1)
+        # The orphan is reaped during cleanup, so the final state is clean.
+        self.assertTrue(payload["cleanup_ok"])
+
+    def test_exited_run_with_slow_tree_reports_cleanup_ok(self) -> None:
+        # The root exits at once while one grandchild still needs ~0.6s.
+        # Cleanup forcibly reaps the tree and verifies it is empty, so
+        # cleanup_ok must report the verified final state, not the fact
+        # that the tree missed the graceful-drain grace period.
+        payload, completed = self.run_json(
+            10000,
+            [
+                sys.executable,
+                "-c",
+                "import subprocess, sys; "
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(0.6)'])",
+            ],
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(payload["status"], "exited")
+        self.assertFalse(payload["timed_out"])
+        self.assertTrue(payload["cleanup_ok"])
 
     def test_argument_quoting_and_unicode(self) -> None:
         code = "import sys; print(repr(sys.argv[1:]))"
