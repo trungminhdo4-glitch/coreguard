@@ -30,7 +30,11 @@ DEFAULT_EXE = BUILD / "coreguard.exe"
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
-HANDLE_COUNT_TOLERANCE = 4
+# Persistent net handle drift allowed after the explicit warmup. Measured
+# benign net is 0 across 9 warmup runs (one historic warm-gate series showed
+# +1); the smallest permanent-leak falsifier is +5. 2 keeps one handle of
+# headroom above the benign envelope and three below the falsifier.
+HANDLE_DRIFT_TOLERANCE = 2
 SEED = 0xC0DE03
 # The tree fixture starts a Python interpreter and spawns a grandchild before
 # it can publish its two PIDs, so the timeout is a precondition for observing
@@ -1468,62 +1472,52 @@ def run_handle_stress(exe: pathlib.Path) -> dict[str, Any]:
         + ["timeout"] * 12
         + ["tree_timeout"] * 8
     )
-    before = current_process_handle_count()
-    samples = [before]
+    # The first subprocess spawn and the first TemporaryDirectory cleanup each
+    # allocate a one-time batch of parent handles (measured +3 and +7, flat
+    # afterwards). Exercise exactly those two paths once before the baseline is
+    # read, so their cold-start batches land in the baseline instead of being
+    # mistaken for stress-loop accumulation. Both warmup cases run the normal
+    # product path and must pass their own cleanup assertions.
+    warmup = ["normal", "tree_timeout"]
+    for kind in warmup:
+        stress_case(exe, kind)
+    gc.collect()
+    baseline = current_process_handle_count()
+    samples = [baseline]
     for index, kind in enumerate(sequence, start=1):
         stress_case(exe, kind)
         if index % 8 == 0:
             gc.collect()
             samples.append(current_process_handle_count())
     gc.collect()
-    after = current_process_handle_count()
-    samples.append(after)
-    calibration_before = after
-    stress_case(exe, "tree_timeout")
-    gc.collect()
-    calibration_after = current_process_handle_count()
-    samples.append(calibration_after)
-    # A parent handle count can take isolated batch shifts that have nothing to
-    # do with accumulation: the first subprocess spawn and the first tree
-    # timeout each added 6-7 handles once, then stayed flat. Counting shifts
-    # cannot tell those from a one-shot leak, so only *sustained* growth is a
-    # failure: growth in two consecutive sampling windows, or in the single
-    # calibration call that immediately follows the last window. A permanent
-    # one-time plateau stays outside this oracle's resolution by construction.
-    growth_windows = [
-        index
-        for index, (left, right) in enumerate(zip(samples, samples[1:]))
-        if right - left > HANDLE_COUNT_TOLERANCE
-    ]
-    if calibration_after > calibration_before + HANDLE_COUNT_TOLERANCE:
+    final = current_process_handle_count()
+    samples.append(final)
+    net_drift = final - baseline
+    if net_drift > HANDLE_DRIFT_TOLERANCE:
         raise VerificationFailure(
-            "parent handle count continued growing: samples=%r" % samples
-        )
-    if any(
-        following == previous + 1
-        for previous, following in zip(growth_windows, growth_windows[1:])
-    ):
-        raise VerificationFailure(
-            "parent handle count grew across consecutive windows: samples=%r" % samples
+            "parent handle count drifted by %d handles across the stress loop: "
+            "samples=%r" % (net_drift, samples)
         )
     return {
         "status": "PASS",
-        "iterations": len(sequence) + 1,
-        "breakdown": dict(Counter(sequence + ["calibration_tree_timeout"])),
-        "parent_handle_count_before": before,
-        "parent_handle_count_after": after,
+        "iterations": len(warmup) + len(sequence),
+        "breakdown": dict(Counter(sequence)),
+        "warmup_cases": warmup,
+        "post_warmup_baseline": baseline,
+        "parent_handle_count_after": final,
+        "net_handle_drift": net_drift,
+        "handle_drift_tolerance": HANDLE_DRIFT_TOLERANCE,
         "parent_handle_count_samples": samples,
-        "handle_count_growth_windows": growth_windows,
-        "one_time_baseline_shift": after - before,
         "tree_stress_timeout_ms": TREE_STRESS_TIMEOUT_MS,
         "tree_stress_stall_timeout_ms": TREE_STRESS_STALL_TIMEOUT_MS,
         "measurement_limit": (
             "GetProcessHandleCount covers the Python verifier process only; "
             "per-type child/job/thread/pipe handles are not directly observable here."
         ),
-        "growth_contract": (
-            "isolated one-time shifts in one sampling window are tolerated; "
-            "growth in consecutive windows or in the calibration call fails"
+        "handle_contract": (
+            "after one explicit warmup of the first-spawn and first-tree-timeout "
+            "paths, repeated coreguard runs must not leave a persistent net "
+            "increase of the verifier process's handle count"
         ),
     }
 
