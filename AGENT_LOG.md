@@ -58,3 +58,20 @@ Details:
 - Positive control: fixed binary 10/10 `run_cpu_enforcement` sections PASS; full gate PASS; 122 unittest cases OK (2 skipped) with `COREGUARD_VCVARS` set.
 - Deliberately unchanged: the natural-exit boundary loop (10 runs, `--burn 0.15` against a 200 ms limit) accepts both `exited` and `resource_limit`; it is a boundary fixture, not an enforcement proof, so no bound was added there.
 - Not verified: GitHub Actions (local MSVC substitute). Push/PR only on the dedicated feature branch.
+
+### 2026-09-26 - Handle-stress predicate fails only on sustained growth
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | `run_handle_stress` counted isolated one-time handle shifts as leakage; a correct cold verifier process failed with two shifts |
+| Commit | `562ee16` |
+| Ergebnis | OK - old predicate FAILs the reproduced cold run (`[133,139x6,146,146,146]`, matches the recorded wave257 cold failure `[132,138x6,145x3]`), new predicate PASSes it; injected 1-handle-per-stress-case leak, late-start leak and calibration-only leak still FAIL; 10/10 cold runs PASS, 3/3 leak injections FAIL; 122 unittest OK (2 skipped); full gate PASS |
+
+Details:
+
+- Defect: the parent verifier's handle count takes isolated one-time batch shifts that are unrelated to accumulation - measured `+6` at the first subprocess spawn and `+7` at the first tree timeout, both flat afterwards. `len(positive_jumps) > 1` failed such a correct run; the identical code passed when earlier verification sections had already warmed the process, so the verdict depended on process history, not on the stress loop. Recorded earlier in `reports/wave257/HANDOFF.md` and `reports/wave260/HANDOFF.md` as an open, separate defect.
+- Change: `growth_windows` records every sampling window whose delta exceeds `HANDLE_COUNT_TOLERANCE`; failure now requires growth in two consecutive windows (or in the calibration call, unchanged). Isolated one-time shifts are tolerated and reported. Test-only; no product, CLI or ABI change.
+- Falsifiers (real `CreateEventW` handles injected through the production `stress_case` path): 1 handle per case -> FAIL `grew across consecutive windows`; leak starting at case 40 -> FAIL; +6 in the calibration call only -> FAIL `continued growing`; 10-handle transient opened at case 9 and closed at case 20 -> PASS. Known residual: two benign >4 shifts in adjacent windows would still fail, and the stricter sensitivity of the old predicate for probabilistic per-call leaks (p=0.5: 79% -> 50% detection; uniform per-call leak stays 100%) is the price for removing the cold false positive; a one-shot permanent plateau is outside this oracle's resolution by construction.
+- Positive: 10/10 cold `run_handle_stress` PASS with a deterministic `[132,135x6,142x3]` series; full `tests/verification.py` PASS (`blocked_sections: []`, samples `[142x7,143x3]`); `python -m unittest discover -s tests -p "test_*.py"` 122 OK (2 skipped); MSVC x64 Release `/W4 /WX /analyze` build clean.
+- Not verified: GitHub Actions (local MSVC substitute). Push/PR only on the dedicated feature branch, owner gate.
