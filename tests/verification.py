@@ -17,6 +17,8 @@ import time
 from collections import Counter
 from typing import Any
 
+from helpers import leak_marker
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -269,9 +271,15 @@ def run_tree_timeout(
     BUILD.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="coreguard-tree-", dir=str(BUILD)) as temp:
         pid_file = pathlib.Path(temp) / "pids.txt"
-        payload, completed = run_coreguard(
-            exe, timeout_ms, [sys.executable, str(TREE_HELPER), str(pid_file)]
-        )
+        marker = leak_marker.new_marker_name()
+        fixture = [
+            sys.executable,
+            str(TREE_HELPER),
+            "--marker",
+            marker,
+            str(pid_file),
+        ]
+        payload, completed = run_coreguard(exe, timeout_ms, fixture)
         if completed.returncode != 124 or payload["status"] != "timeout":
             raise VerificationFailure("tree timeout was not classified correctly")
         if not payload["cleanup_ok"]:
@@ -284,7 +292,7 @@ def run_tree_timeout(
             payload, completed = run_coreguard(
                 exe,
                 TREE_STRESS_STALL_TIMEOUT_MS,
-                [sys.executable, str(TREE_HELPER), str(pid_file)],
+                fixture,
             )
             if completed.returncode != 124 or payload["status"] != "timeout":
                 raise VerificationFailure(
@@ -295,13 +303,24 @@ def run_tree_timeout(
                     "tree timeout retry reported cleanup failure"
                 )
             pids = published_tree_pids(pid_file)
-            if pids is None:
-                raise VerificationFailure(
-                    "tree fixture did not publish PIDs within %d ms"
-                    % TREE_STRESS_STALL_TIMEOUT_MS
-                )
+        # The fixture creates the marker before it publishes PIDs and holds it
+        # for process lifetime, so a survivor is observable even when the kill
+        # fired before the PID file existed and the retry re-ran the tree.
+        if not leak_marker.wait_marker_absent(marker):
+            raise VerificationFailure(
+                "tree timeout left a named-object survivor holder: %s" % marker
+            )
+        if pids is None:
+            raise VerificationFailure(
+                "tree fixture did not publish PIDs within %d ms"
+                % TREE_STRESS_STALL_TIMEOUT_MS
+            )
         assert_pids_gone(pids)
-        return {"status": payload["status"], "pids_checked": len(pids)}
+        return {
+            "status": payload["status"],
+            "pids_checked": len(pids),
+            "survivor_marker_cleared": True,
+        }
 
 
 def run_resource_enforcement(exe: pathlib.Path) -> dict[str, Any]:
