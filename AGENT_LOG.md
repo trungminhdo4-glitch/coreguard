@@ -75,3 +75,23 @@ Details:
 - Falsifiers (real `CreateEventW` handles injected through the production `stress_case` path): 1 handle per case -> FAIL `grew across consecutive windows`; leak starting at case 40 -> FAIL; +6 in the calibration call only -> FAIL `continued growing`; 10-handle transient opened at case 9 and closed at case 20 -> PASS. Known residual: two benign >4 shifts in adjacent windows would still fail, and the stricter sensitivity of the old predicate for probabilistic per-call leaks (p=0.5: 79% -> 50% detection; uniform per-call leak stays 100%) is the price for removing the cold false positive; a one-shot permanent plateau is outside this oracle's resolution by construction.
 - Positive: 10/10 cold `run_handle_stress` PASS with a deterministic `[132,135x6,142x3]` series; full `tests/verification.py` PASS (`blocked_sections: []`, samples `[142x7,143x3]`); `python -m unittest discover -s tests -p "test_*.py"` 122 OK (2 skipped); MSVC x64 Release `/W4 /WX /analyze` build clean.
 - Not verified: GitHub Actions (local MSVC substitute). Push/PR only on the dedicated feature branch, owner gate.
+
+### 2026-09-26 - Handle-stress oracle measures post-warmup net drift (supersedes the adjacency predicate)
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | Das Wave-262-Adjazenz-Praedikat tolerierte einen permanenten, ueber nicht-adjazente Fenster verteilten +15-Handle-Leak. Die dafuer verantwortlichen zwei kalten Lazy-Shifts werden jetzt per explizitem Warmup aus dem Messfenster entfernt; danach gilt eine Netto-Drift-Invariante. |
+| Commit | `1830659` |
+| Ergebnis | OK - Alt-Praedikat kalt reproduziert (`[132,138x6,145x3]`, == wave257-Serie); Warmup entfernt beide Shifts (net 0 in 9/9 Vorlaeufen, kalt 10/10); alle Pflicht-Falsifier FAILen inkl. spaced +15; Transient PASS; 122 unittest OK (2 skipped); volles Gate PASS; MSVC /W4 /WX /analyze clean |
+
+Details:
+
+- Attributionsmessung (frischer Prozess, MEASURED): erster `subprocess.run` +3 Handles; erstes `TemporaryDirectory` create+delete +7 (nicht der Kill, nicht rmtree allein, nicht OpenProcess); danach jede weitere Operation 0. Beide Shifts sind synchron und einmalig.
+- Warmup-Varianten (je frischer Prozess, 56-Fall-Sequenz, Netto final-baseline): ohne Warmup +10; nur `normal` +7; `normal` + `tree_timeout` net 0 in 6/6 (plus `all`-Warmup 3/3 net 0). Deshalb Warmup exakt aus den zwei Shift-Ausloesern; beide laufen den normalen Produktpfad mit ihren Cleanup-Assertions.
+- Neue Invariante: `HANDLE_DRIFT_TOLERANCE = 2`, FAIL nur bei `final - baseline > 2`; der Kalibrierungs-Call entfaellt (unter Netto-Check redundant). Begruendung der 2: gemessener benigner Netto-Drift 0 in 10/10 kalt und 6/6 warm, +1 im warmen Gate; kleinster geforderter Falsifier +5 -> 1 Handle Kopfraum, 3 Abstand.
+- Falsifier mit echten `CreateEventW`-Handles durch den Produktionspfad: uniform +1/Kall net 56 FAIL; +5 bei Calls 1/17/33 net 15 FAIL (das fruehere Hole); einmaliges +5 Plateau net 5 FAIL; +1 alle 5 Calls net 11 FAIL; 10-Handle-Transient geschlossen net 0 PASS; kein Injekt net 0 PASS 10/10; warm (2 Laeufe im selben Prozess) 6/6 net 0.
+- Loop A: `cg-oldgate` (unveraendertes main a9fbf53) FAILt kalt mit `[132,138x6,145x3]`; das neue Orakel besteht dieselben Konstellationen.
+- Adversarial (read-only Subagent): Aufloesungsgrenzen praezise dokumentiert - <=2 permanente Handles unsichtbar (Toleranzentscheidung), pre-baseline-Masking nur mit injiziertem Verifier-Zustand (produktpfad-unerreichbar), gc-collectible Akkumulation per Design unsichtbar, Warmup-Erstaufrufe sind vom Vertrag ausgenommen; `GetProcessHandleCount`-Fehler fail-closed.
+- Regression: `python -m unittest discover -s tests -p "test_*.py"` 122 OK (2 skipped); `tests/verification.py` PASS (`blocked_sections: []`, 32,4 s; Handle-Section 4,9 s, 58 Faelle = 2 Warmup + 56); MSVC x64 Release `/W4 /WX /analyze` clean. Kein CI-Kostenanstieg gegenueber 389b380 (Gate 32,3 s). Test-only, keine Produkt-/CLI-/ABI-/Packaging-Aenderung.
+- Ersetzt das Adjazenz-Praedikat aus `562ee16`/`389b380`; Branch `agent/coreguard-handle-invariant` bleibt lokal und unpubliziert. Wave 261b (`d3249bc`) ist remote, aber noch ohne PR/CI; Publikation bleibt Owner-Gate.
