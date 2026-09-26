@@ -40,3 +40,21 @@ Details:
 
 - Measured the sleeping Python child's user CPU on the unchanged published line: 0-62 ms across 16 runs, 1 run tripped the 50 ms limit (identical failure mode on `origin/main`, so not a regression of this branch).
 - The child still sleeps ~1 s against a 1500 ms wall timeout; the test keeps proving that a CPU limit is not reported as a wall-clock timeout.
+
+### 2026-09-26 11:00 - Containment evidence without PID publication
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | Tree-timeout containment is verified through a named-object survivor oracle, so an unpublished-PID leak can no longer hide behind the retry |
+| Commit | `6988a73` |
+| Ergebnis | OK - pristine gate PASSes with a live unpublished survivor (A/B), changed gate FAILs (same survivor), passes after cleanup; 125 unittest OK (2 skipped); full gate PASS, `blocked_sections: []` |
+
+Details:
+
+- Gap: `run_tree_timeout` could only check PIDs the fixture wrote to disk; when the kill fired before publication it retried with the same pid_file and checked only the retry's PIDs, so a first-attempt survivor was unobservable.
+- Oracle: the fixture creates a session-unique `Local\CoreGuard-<uuid>` mutex before publishing PIDs and holds it for process lifetime. `OpenMutexW(SYNCHRONIZE)` success proves a holder; `ERROR_FILE_NOT_FOUND` is the only error treated as clean; every probe handle is closed immediately. Bounded enumeration by unique argv token was prototyped and rejected as the shipped oracle: 149 of 283 processes were unreadable in a full sweep (access denied / invalid parameter), so a missing token proves nothing, and `NtQueryInformationProcess(ProcessCommandLineInformation=60)` is undocumented. Marker: two syscalls, no enumeration, deterministic positive.
+- Wiring: `run_tree_timeout` uses one marker per call for both attempts and checks absence after the retry, so the retry can no longer mask a first-attempt leak; the section reports `survivor_marker_cleared`.
+- Controls: injected unpublished survivor -> old gate PASS / new gate FAIL / new gate PASS after kill; 10/10 `run_tree_timeout` runs stable; direct oracle lifetime check (absent -> create -> holder -> close -> absent); legacy fixture shapes (`pid_file` and `--grandchild`) publish PIDs unchanged.
+- Bound and wording: presence proves a survivor; absence is a bounded clearance signal for cooperative fixture processes whose first action is the marker call. No README/SECURITY change, no false security promise.
+- Not verified: GitHub Actions (local MSVC substitute); no product code touched, binary unchanged (0ffd8aa build).
