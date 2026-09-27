@@ -42,17 +42,24 @@ def discover_executable() -> pathlib.Path | None:
 
 
 def configured_version(executable: pathlib.Path) -> str:
-    """The version CMake was configured with; absence means a dev build."""
+    """The version CMake was configured with; absence means a dev build.
 
-    cache = executable.parent.parent / "CMakeCache.txt"
-    if cache.is_file():
-        match = re.search(
-            r"^COREGUARD_VERSION:STRING=(.*)$",
-            cache.read_text(encoding="utf-8"),
-            re.MULTILINE,
-        )
-        if match is not None and VERSION_PATTERN.fullmatch(match.group(1).strip()):
-            return match.group(1).strip()
+    The cache sits next to the executable (single-config generators) or one
+    directory above it (Visual Studio ``Release/`` layout).
+    """
+
+    for candidate in (executable.parent, executable.parent.parent):
+        cache = candidate / "CMakeCache.txt"
+        if cache.is_file():
+            match = re.search(
+                r"^COREGUARD_VERSION:STRING=(.*)$",
+                cache.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
+            if match is not None and VERSION_PATTERN.fullmatch(
+                match.group(1).strip()
+            ):
+                return match.group(1).strip()
     return "dev"
 
 

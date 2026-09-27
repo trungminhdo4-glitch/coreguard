@@ -229,6 +229,10 @@ def packaged_executable_sha256(archive_path: pathlib.Path) -> str:
         raise ReleaseTrustError(
             f"release archive does not exist: {archive_path}"
         ) from exc
+    except OSError as exc:
+        raise ReleaseTrustError(
+            f"cannot read release archive {archive_path}: {exc}"
+        ) from exc
     except zipfile.BadZipFile as exc:
         raise ReleaseTrustError(f"invalid ZIP archive: {archive_path}") from exc
     except KeyError as exc:
