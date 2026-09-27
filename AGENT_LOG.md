@@ -1,5 +1,23 @@
 # Agent Log
 
+### 2026-09-27 - K1 post-merge acceptance and v0.2.0 release-candidate preparation
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | Accept K1 on `main`, freeze the v0.2.0 scope, and prepare plus locally verify the release candidate without tag or release |
+| Commit | `7a6e5bb` (release-prep) |
+| Ergebnis | OK - K1_RUNTIME_IDENTITY_REMOTE_ACCEPTED (PR #18 merged as `c595663`; merge tree equals the K1 head tree; Windows CI green on the merge SHA); 133 unittest OK (2 skipped); `tests/verification.py` PASS (12 sections, 0 blocked); packaging proof 0.2.0 all gates PASS; release dry-run 0.2.0 PASS (ZIP sha256 `2f9431d0...`, exe sha256 `a3ed2b17...`, manifest/checksums verified); 10/10 negative controls fail closed; JSON key/type contract v0.1.0 to v0.2.0 unchanged across 8 fixtures; no tag, no release, no attestation, no push |
+
+Details:
+
+- Post-merge: `origin/main` is `c595663` with parents `e941dc4` + `5d31755`; the merge tree is byte-identical to the K1 head tree, so there is no contract drift. Only the historical release note (`docs/release-notes-v0.1.0.md`) had a factual license drift (it claimed MIT although the v0.1.0 tag and GitHub Release ship PolyForm Strict 1.0.0); corrected without touching the tag or the GitHub Release.
+- Packaging proof was a standalone script that neither Windows CI nor the release trust pipeline executed. The smallest integration runs the existing `tests/test_packaging.py --version <X.Y.Z> --build-root build/release-readiness` inside the `scripts/windows_release_trust.ps1` developer command chain, which the PR dry-run workflow also reaches. No second packaging framework was built.
+- Exit channel: a child exit code of `256` surfaces as `0` in the conventional process return code (`src/main.c` returns `exit_code & 0xff`); the JSON `exit_code` carries the full value and stays authoritative. Documented as a known limitation in the README; no semantic change.
+- Scope freeze: containment, resource limits, execution context, bounded capture, runtime `--version`, CMake package, and release provenance/trust are in v0.2.0. K2 JSON evidence and K3 stdin are deferred (no blocked runtime consumer). The K16 external nested-job harness gap (stale `D:\coreguard` path) is not a CoreGuard product blocker and stays a separate cross-repo follow-up.
+- Negative controls (expected 0.2.0 vs binary 0.2.1; artifact-name mismatch in both directions; malformed version; wrong manifest commit; tag-less release evidence; tag/version mismatch; tag build-gate mismatch; tampered ZIP digest; package config 0.2.1) all fail closed.
+- Not performed: no `v0.2.0` tag, no GitHub Release, no attestation, no push (owner gate).
+
 ### 2026-09-27 - K1 mini-experiment: CLI runtime version identity closure
 
 | Feld | Wert |

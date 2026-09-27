@@ -33,9 +33,11 @@ runs on `windows-latest` with only `contents: read` and uses the same
 `scripts/windows_release_trust.ps1` and `scripts/release_trust.py` primitives
 as the future release workflow. The hosted runner performs MSVC activation,
 CMake configure, Release build, the existing tests and `verification.py`,
-CPack ZIP creation, package/version gates, `SHA256SUMS` generation and
-verification, `release-manifest.json` generation and verification, and uploads
-the evidence for CI inspection.
+the packaging proof (`tests/test_packaging.py`: relocation, exact-version
+acceptance and rejection, archive inventory, LICENSE byte identity and tamper
+detection, packaged CLI identity), CPack ZIP creation, package/version gates,
+`SHA256SUMS` generation and verification, `release-manifest.json` generation
+and verification, and uploads the evidence for CI inspection.
 
 The validation version is the synthetic `99.99.99`. It is passed directly to
 CMake; no repository ref is created. The generated manifest records
