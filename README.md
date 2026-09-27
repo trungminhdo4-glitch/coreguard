@@ -8,9 +8,9 @@ reports bounded execution results as a C API or as a command-line JSON result.
 It does not replace an application harness, scheduler, sandbox, or policy
 system.
 
-The supported v0.1.0 contract is Windows x64, MSVC, a Release build, and
-static linking. No third-party runtime dependency is required beyond the
-Windows SDK and the MSVC/UCRT environment.
+The supported contract of this source tree is Windows x64, MSVC, a Release
+build, and static linking. No third-party runtime dependency is required beyond
+the Windows SDK and the MSVC/UCRT environment.
 
 ## Build
 
@@ -53,14 +53,15 @@ The install tree contains:
   LICENSE
 ```
 
-For a versioned build, configure with `-DCOREGUARD_VERSION=0.1.0`; the exact
-version package file is then installed and CPack produces
-`coreguard-0.1.0-windows-x64-msvc.zip`.
+For a versioned build, configure with a numeric `-DCOREGUARD_VERSION=<X.Y.Z>`;
+the exact version package file is then installed and CPack produces
+`coreguard-<X.Y.Z>-windows-x64-msvc.zip`.
 
-An external CMake consumer can link the installed static library with:
+An external CMake consumer can link the installed static library with (replace
+`<X.Y.Z>` with the installed package version):
 
 ```cmake
-find_package(coreguard 0.1.0 EXACT CONFIG REQUIRED)
+find_package(coreguard <X.Y.Z> EXACT CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE coreguard::coreguard)
 ```
 
@@ -202,6 +203,10 @@ contents.
 - There is no stable cross-version ABI guarantee.
 - Coreguard does not provide network, disk, UI, scheduler, IPC, or general
   sandbox policy enforcement.
+- The Windows process exit channel carries only the conventional process-exit
+  semantics; a child exit code such as `256` can appear as `0` to the calling
+  shell or process. The structured `--json` result always reports the full
+  `exit_code` value and is authoritative for the child exit status.
 - The archive is unsigned and no package-manager integration is provided.
 
 ## Future release verification

@@ -19,4 +19,7 @@ The release is static-only and does not promise a stable cross-version ABI.
 The supported distribution scope is Windows x64 with MSVC/UCRT in a Release
 configuration. The archive is unsigned.
 
-License: MIT License.
+License: PolyForm Strict License 1.0.0. The v0.1.0 tag and its published
+release ship the PolyForm Strict 1.0.0 `LICENSE`; Coreguard v0.1.0 was
+source-available, not open source. The current `main` source tree is licensed
+under MIT (see the repository `LICENSE` file).
