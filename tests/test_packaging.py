@@ -110,6 +110,14 @@ def assert_inventory(root: pathlib.Path, archive: pathlib.Path | None = None) ->
     return inventory
 
 
+def assert_archive_license_identity(
+    archive: pathlib.Path, license_path: pathlib.Path
+) -> None:
+    with zipfile.ZipFile(archive) as package:
+        if package.read("LICENSE") != license_path.read_bytes():
+            raise PackagingProofError("archived LICENSE is not byte-identical")
+
+
 def copy_prefix(source: pathlib.Path, destination: pathlib.Path) -> None:
     shutil.copytree(source, destination)
 
@@ -380,11 +388,20 @@ def run_manual_consumer(root: pathlib.Path, prefix: pathlib.Path) -> None:
     run([str(executable)], cwd=manual, timeout=60)
 
 
-def run_cli(prefix: pathlib.Path) -> dict[str, Any]:
+def run_cli(prefix: pathlib.Path, expected_version: str | None = None) -> dict[str, Any]:
     cli = prefix / "bin" / "coreguard.exe"
     help_result = run([str(cli), "--help"], cwd=cli.parent)
     if "Usage: coreguard run" not in help_result.stdout:
         raise PackagingProofError("installed CLI help output is missing")
+
+    identity_result = run([str(cli), "--version"], cwd=cli.parent)
+    expected_identity = f"coreguard {expected_version or 'dev'}\n"
+    if identity_result.stdout != expected_identity or identity_result.stderr != "":
+        raise PackagingProofError(
+            "installed CLI runtime identity mismatch: "
+            f"expected {expected_identity!r}, received "
+            f"stdout={identity_result.stdout!r} stderr={identity_result.stderr!r}"
+        )
 
     def json_payload(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
         try:
@@ -471,6 +488,7 @@ def run_cli(prefix: pathlib.Path) -> dict[str, Any]:
 
     return {
         "help": "PASS",
+        "version_identity": expected_identity.strip(),
         "normal_exit": "PASS",
         "timeout": "PASS",
         "resource_limit": "PASS",
@@ -717,9 +735,7 @@ def main() -> int:
         inventory_archive = assert_inventory(install_a, archive)
         if inventory_archive != inventory_a:
             raise PackagingProofError("archive inventory differs from install inventory")
-        with zipfile.ZipFile(archive) as package:
-            if package.read("LICENSE") != license_path.read_bytes():
-                raise PackagingProofError("archived LICENSE is not byte-identical")
+        assert_archive_license_identity(archive, license_path)
         digest = sha256(archive)
         if digest != sha256(archive):
             raise PackagingProofError("SHA-256 changed between calculations")
@@ -742,6 +758,22 @@ def main() -> int:
         gates["inventory_hygiene"] = "PASS"
         gates["sha256"] = "PASS"
         gates["license_byte_identity_archive"] = "PASS"
+
+        tampered_license_archive = work / "tampered-license.zip"
+        with zipfile.ZipFile(archive_copy) as source_zip, zipfile.ZipFile(
+            tampered_license_archive, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target_zip:
+            for info in source_zip.infolist():
+                content = source_zip.read(info.filename)
+                if info.filename == "LICENSE":
+                    content = content + b"\ntampered license probe\n"
+                target_zip.writestr(info, content)
+        try:
+            assert_archive_license_identity(tampered_license_archive, license_path)
+        except PackagingProofError:
+            gates["negative_license_tamper"] = "PASS (license mismatch detected)"
+        else:
+            raise PackagingProofError("tampered LICENSE was not rejected")
 
         for extracted in (extracted_a, extracted_b):
             extracted.mkdir()
@@ -794,7 +826,12 @@ def main() -> int:
         gates["relocation"] = "PASS"
         if args.version:
             gates["version_aware_exact_find_package"] = "PASS"
-            for incompatible_version in ("0.1.1", "1.0.0"):
+            incompatible_versions = ["0.1.1", "1.0.0"]
+            major, minor, patch = args.version.split(".")
+            patch_neighbor = f"{major}.{minor}.{int(patch) + 1}"
+            if patch_neighbor not in incompatible_versions:
+                incompatible_versions.append(patch_neighbor)
+            for incompatible_version in incompatible_versions:
                 version_label = incompatible_version.replace(".", "_")
                 negative_version_root = work / f"negative-version-{version_label}"
                 negative_version, _ = write_consumer(
@@ -815,8 +852,9 @@ def main() -> int:
         else:
             gates["version_aware_exact_find_package"] = "NOT_APPLICABLE"
             gates["version_rejection"] = "NOT_APPLICABLE"
-        cli_result = run_cli(extracted_a)
+        cli_result = run_cli(extracted_a, args.version)
         gates["packaged_cli"] = cli_result
+        gates["packaged_cli_runtime_identity"] = "PASS"
         dependency_audit = audit_dependencies(work, extracted_a)
         gates["runtime_dependency_audit"] = "PASS"
 

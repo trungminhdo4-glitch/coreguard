@@ -17,10 +17,15 @@ from release_trust import (  # noqa: E402
     EXPECTED_PACKAGE_FILES,
     ReleaseTrustError,
     expected_archive_name,
+    expected_runtime_identity,
+    packaged_executable_sha256,
     release_version_from_tag,
     validate_version,
     validate_configured_build,
     validate_package,
+    validate_runtime_identity_output,
+    verify_packaged_executable_identity,
+    verify_runtime_identity,
     verify_sha256sums,
     verify_release_manifest,
     write_release_evidence,
@@ -220,6 +225,76 @@ class ReleaseTrustTests(unittest.TestCase):
                 )["status"],
                 "PASS",
             )
+
+    def test_runtime_identity_output_contract(self) -> None:
+        expected = expected_runtime_identity(VERSION)
+        self.assertEqual(expected, "coreguard 1.2.3\r\n")
+        validate_runtime_identity_output(
+            returncode=0,
+            stdout=expected.encode("ascii"),
+            stderr=b"",
+            version=VERSION,
+        )
+        wrong_outputs = {
+            "wrong version": b"coreguard 1.2.4\r\n",
+            "development identity": b"coreguard dev\r\n",
+            "no newline": b"coreguard 1.2.3",
+            "unix newline": b"coreguard 1.2.3\n",
+            "extra output": b"coreguard 1.2.3\r\ncoreguard 1.2.3\r\n",
+            "trailing text": b"coreguard 1.2.3 (release)\r\n",
+        }
+        for label, stdout in wrong_outputs.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ReleaseTrustError, "runtime identity"):
+                    validate_runtime_identity_output(
+                        returncode=0, stdout=stdout, stderr=b"", version=VERSION
+                    )
+        with self.assertRaisesRegex(ReleaseTrustError, "exited with code"):
+            validate_runtime_identity_output(
+                returncode=1,
+                stdout=b"coreguard 1.2.3\r\n",
+                stderr=b"",
+                version=VERSION,
+            )
+        with self.assertRaisesRegex(ReleaseTrustError, "stderr"):
+            validate_runtime_identity_output(
+                returncode=0,
+                stdout=b"coreguard 1.2.3\r\n",
+                stderr=b"noise",
+                version=VERSION,
+            )
+
+    def test_runtime_identity_gate_executes_the_binary(self) -> None:
+        # Python always exists and never satisfies the CLI identity contract,
+        # so this proves the gate executes and compares instead of merely
+        # checking that the executable path exists.
+        with self.assertRaisesRegex(ReleaseTrustError, "runtime identity mismatch"):
+            verify_runtime_identity(pathlib.Path(sys.executable), VERSION)
+        with self.assertRaisesRegex(ReleaseTrustError, "does not exist"):
+            verify_runtime_identity(
+                pathlib.Path(tempfile.gettempdir()) / "missing-coreguard.exe",
+                VERSION,
+            )
+
+    def test_packaged_executable_must_equal_the_built_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            archive = root / expected_archive_name(VERSION)
+            make_archive(archive)
+            executable = root / "coreguard.exe"
+            executable.write_bytes(b"fixture:bin/coreguard.exe")
+            self.assertEqual(
+                packaged_executable_sha256(archive),
+                hashlib.sha256(executable.read_bytes()).hexdigest(),
+            )
+            result = verify_packaged_executable_identity(executable, archive)
+            self.assertEqual(result["artifact_filename"], archive.name)
+            self.assertEqual(
+                result["coreguard_exe_sha256"], result["packaged_exe_sha256"]
+            )
+            executable.write_bytes(b"fixture:bin/coreguard.exe (modified)")
+            with self.assertRaisesRegex(ReleaseTrustError, "differs from the executed"):
+                verify_packaged_executable_identity(executable, archive)
 
     def test_workflow_is_tag_only_and_owner_gated_for_publication(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
