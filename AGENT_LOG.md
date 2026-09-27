@@ -1,5 +1,22 @@
 # Agent Log
 
+### 2026-09-27 - K1 mini-experiment: CLI runtime version identity closure
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | `coreguard --version` reports the build-time identity (`coreguard dev` / `coreguard X.Y.Z`); Windows release trust executes the built CLI and binds its identity to the configured version and the packaged executable |
+| Commit | `351c689` (implementation) |
+| Ergebnis | OK - 133 unittest OK (2 skipped); `tests/verification.py` PASS (12 sections, `blocked_sections: []`); packaging RC proof 0.2.0 all gates PASS (EXACT consumer 0.2.0 + rejection 0.2.1, packaged CLI identity `coreguard 0.2.0`, LICENSE byte identity + tamper probe); local release dry-run 0.2.0 PASS (no tag, no release, no push) |
+
+Details:
+
+- Baseline: `coreguard --version` exited 2 with usage on stderr. Historical `agent/coreguard-json-evidence` semantics were ported manually; the branch itself was not merged, rebased or cherry-picked (26 commits behind main).
+- Contract: CMake defines `COREGUARD_CLI_VERSION_STRING` only for `coreguard_cli` (the project version for versioned builds, else `dev`); `src/main.c` keeps the `dev` fallback for direct `build-msvc.bat` builds. `--version` is top-level-only, side-effect-free and mirrors `--help` argument handling; `run --version` stays a usage error.
+- Release trust: new `verify-runtime-identity` gate (`scripts/release_trust.py`) executes the just-built exe and requires exact stdout `coreguard <version>` with CRLF, exit 0 and empty stderr; with `--artifact` it also proves the packaged `bin/coreguard.exe` shares the built exe sha256. Invoked from `scripts/windows_release_trust.ps1`.
+- Falsified live: 0.2.0 build vs expected 0.2.1, 0.2.1 build vs expected 0.2.0, dev build vs expected 0.2.0, tampered package (exe hash mismatch) - all fail closed.
+- Not verified: GitHub Actions (local MSVC substitute; local vswhere cannot see the VS18 install, so the PS1 was parse-checked and its gate sequence run manually). Not pushed (owner gate). No `v0.2.0` tag exists.
+
 ### 2026-09-23 00:20 - CPU-only wait polling removed
 
 | Feld | Wert |

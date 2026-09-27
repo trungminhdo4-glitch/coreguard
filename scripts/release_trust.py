@@ -13,6 +13,7 @@ import hashlib
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ TAG_PATTERN = re.compile(r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$")
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+RUNTIME_IDENTITY_TIMEOUT_SECONDS = 30
 
 EXPECTED_PACKAGE_FILES = frozenset(
     {
@@ -188,6 +190,122 @@ def validate_package(archive_path: pathlib.Path, version: str | None = None) -> 
         coreguard_exe_sha256=sha256_bytes(executable),
         entries=tuple(sorted(names)),
     )
+
+
+def expected_runtime_identity(version: str) -> str:
+    """Return the exact stdout line the CLI must print for ``--version``.
+
+    The executable is Windows-only and the MSVC CRT opens ``stdout`` in text
+    mode, so ``printf`` terminates the line with CRLF.
+    """
+
+    return f"coreguard {validate_version(version)}\r\n"
+
+
+def validate_runtime_identity_output(
+    *, returncode: int, stdout: bytes, stderr: bytes, version: str
+) -> None:
+    """Fail closed unless one executed binary reports exactly its version."""
+
+    expected = expected_runtime_identity(version).encode("ascii")
+    if returncode != 0:
+        raise ReleaseTrustError(f"runtime identity check exited with code {returncode}")
+    if stdout != expected:
+        raise ReleaseTrustError(
+            f"runtime identity mismatch: expected {expected!r}, received {stdout!r}"
+        )
+    if stderr:
+        raise ReleaseTrustError(f"runtime identity wrote unexpected stderr: {stderr!r}")
+
+
+def packaged_executable_sha256(archive_path: pathlib.Path) -> str:
+    """Hash ``bin/coreguard.exe`` inside a release ZIP without re-validating it."""
+
+    archive_path = pathlib.Path(archive_path).resolve()
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            return sha256_bytes(archive.read("bin/coreguard.exe"))
+    except FileNotFoundError as exc:
+        raise ReleaseTrustError(
+            f"release archive does not exist: {archive_path}"
+        ) from exc
+    except OSError as exc:
+        raise ReleaseTrustError(
+            f"cannot read release archive {archive_path}: {exc}"
+        ) from exc
+    except zipfile.BadZipFile as exc:
+        raise ReleaseTrustError(f"invalid ZIP archive: {archive_path}") from exc
+    except KeyError as exc:
+        raise ReleaseTrustError(
+            f"release archive has no bin/coreguard.exe member: {archive_path}"
+        ) from exc
+
+
+def verify_packaged_executable_identity(
+    executable: pathlib.Path, artifact: pathlib.Path
+) -> dict[str, str]:
+    """Prove that the packaged executable is the one that was built."""
+
+    executable = pathlib.Path(executable).resolve()
+    if not executable.is_file():
+        raise ReleaseTrustError(f"built executable does not exist: {executable}")
+    built_sha = sha256_file(executable)
+    packaged_sha = packaged_executable_sha256(artifact)
+    if packaged_sha != built_sha:
+        raise ReleaseTrustError(
+            "packaged bin/coreguard.exe differs from the executed built "
+            f"executable: packaged {packaged_sha}, built {built_sha}"
+        )
+    return {
+        "coreguard_exe_sha256": built_sha,
+        "packaged_exe_sha256": packaged_sha,
+        "artifact_filename": pathlib.Path(artifact).name,
+    }
+
+
+def verify_runtime_identity(
+    executable: pathlib.Path,
+    version: str,
+    artifact: pathlib.Path | None = None,
+) -> dict[str, str]:
+    """Execute a built CLI and prove its build-time identity.
+
+    With ``artifact`` the check additionally proves that the packaged
+    ``bin/coreguard.exe`` is byte-identical to the executed executable.
+    """
+
+    version = validate_version(version)
+    executable = pathlib.Path(executable).resolve()
+    if not executable.is_file():
+        raise ReleaseTrustError(f"built executable does not exist: {executable}")
+    try:
+        completed = subprocess.run(
+            [str(executable), "--version"],
+            capture_output=True,
+            timeout=RUNTIME_IDENTITY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReleaseTrustError(
+            "runtime identity check timed out after "
+            f"{RUNTIME_IDENTITY_TIMEOUT_SECONDS} seconds"
+        ) from exc
+    except OSError as exc:
+        raise ReleaseTrustError(f"cannot execute {executable}: {exc}") from exc
+    validate_runtime_identity_output(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        version=version,
+    )
+    result = {
+        "status": "PASS",
+        "runtime_identity": f"coreguard {version}",
+        "coreguard_exe_sha256": sha256_file(executable),
+    }
+    if artifact is not None:
+        result.update(verify_packaged_executable_identity(executable, artifact))
+    return result
 
 
 def _cmake_cache_value(cache_text: str, key: str) -> str:
@@ -464,6 +582,11 @@ def main(argv: list[str] | None = None) -> int:
     package_parser.add_argument("--artifact", type=pathlib.Path, required=True)
     package_parser.add_argument("--version")
 
+    identity_parser = subparsers.add_parser("verify-runtime-identity")
+    identity_parser.add_argument("--exe", type=pathlib.Path, required=True)
+    identity_parser.add_argument("--version", required=True)
+    identity_parser.add_argument("--artifact", type=pathlib.Path)
+
     evidence_parser = subparsers.add_parser("write-evidence")
     evidence_parser.add_argument("--artifact", type=pathlib.Path, required=True)
     evidence_version = evidence_parser.add_mutually_exclusive_group(required=True)
@@ -505,6 +628,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "validate-package":
             version = validate_version(args.version) if args.version else None
             print(json.dumps(_summary(validate_package(args.artifact, version)), sort_keys=True))
+        elif args.command == "verify-runtime-identity":
+            result = verify_runtime_identity(args.exe, args.version, args.artifact)
+            print(json.dumps(result, sort_keys=True))
         elif args.command == "write-evidence":
             result = write_release_evidence(
                 archive_path=args.artifact,

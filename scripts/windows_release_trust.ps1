@@ -116,6 +116,12 @@ if (-not (Test-Path -LiteralPath $cpackArtifact)) {
 New-Item -ItemType Directory -Path $releasePath -Force | Out-Null
 Copy-Item -LiteralPath $cpackArtifact -Destination $artifactPath -Force
 
+# K1: execute the just-built CLI and bind its runtime identity to the
+# configured version and to the packaged executable.
+Invoke-PythonGate @(
+    "verify-runtime-identity", "--exe", $executablePath,
+    "--version", $Version, "--artifact", $artifactPath
+)
 Invoke-PythonGate @("validate-version", "--version", $Version)
 if ($Mode -eq "release") {
     Invoke-PythonGate @(

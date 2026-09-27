@@ -152,6 +152,13 @@ output, process metrics, and opt-in Job Object aggregate metrics. A normal
 child exit remains distinct from a start failure, timeout, containment failure,
 or resource-limit result.
 
+`coreguard --version` prints the build-time identity on stdout and exits with
+code 0 without starting a process: `coreguard <X.Y.Z>` for builds configured
+with `-DCOREGUARD_VERSION`, and `coreguard dev` for development builds. The
+identity is compiled in; it performs no Git lookup, network access, or sidecar
+file read. The release trust pipeline executes the built executable and
+verifies this identity against the configured version and the packaged ZIP.
+
 ## Resource limits and metrics
 
 - `--timeout-ms` bounds wall-clock waiting for the controlled Job.

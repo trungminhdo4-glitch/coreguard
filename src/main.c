@@ -12,6 +12,12 @@
 #define CG_START_EXIT_CODE 125
 #define CG_INTERNAL_EXIT_CODE 126
 
+/* Build-time identity. CMake defines the release version for versioned builds;
+   direct compiler builds (build-msvc.bat) fall back to the development tag. */
+#ifndef COREGUARD_CLI_VERSION_STRING
+#define COREGUARD_CLI_VERSION_STRING "dev"
+#endif
+
 static void print_usage(FILE *stream)
 {
     fprintf(stream,
@@ -19,6 +25,7 @@ static void print_usage(FILE *stream)
             "[--memory-limit-mb N] [--cpu-time-limit-ms N] "
             "[--max-processes N] [--cwd DIR] [--env-clear] "
             "[--env NAME=VALUE] [--capture-limit-bytes N] -- command args...\n"
+            "       coreguard --version\n"
             "       coreguard --help\n\n"
             "Runs one executable directly and contains it in a Windows Job Object.\n"
             "--memory-limit-mb applies to the complete controlled process tree.\n"
@@ -615,6 +622,10 @@ int wmain(int argc, wchar_t **argv)
         wcscmp(argv[1], L"-h") == 0) {
         print_usage(stdout);
         return argc < 2 ? 2 : 0;
+    }
+    if (wcscmp(argv[1], L"--version") == 0) {
+        printf("coreguard %s\n", COREGUARD_CLI_VERSION_STRING);
+        return 0;
     }
     if (wcscmp(argv[1], L"run") != 0) {
         print_usage(stderr);
