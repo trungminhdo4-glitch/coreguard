@@ -4,7 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| v0.1.0 | Yes |
+| v0.2.0 | Yes |
+| v0.1.0 | No (historical; released under PolyForm Strict 1.0.0, superseded by v0.2.0) |
 
 ## Reporting a vulnerability
 
