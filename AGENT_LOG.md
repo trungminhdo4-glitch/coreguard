@@ -148,3 +148,21 @@ Details:
 - Adversarial (read-only Subagent): Aufloesungsgrenzen praezise dokumentiert - <=2 permanente Handles unsichtbar (Toleranzentscheidung), pre-baseline-Masking nur mit injiziertem Verifier-Zustand (produktpfad-unerreichbar), gc-collectible Akkumulation per Design unsichtbar, Warmup-Erstaufrufe sind vom Vertrag ausgenommen; `GetProcessHandleCount`-Fehler fail-closed.
 - Regression: `python -m unittest discover -s tests -p "test_*.py"` 122 OK (2 skipped); `tests/verification.py` PASS (`blocked_sections: []`, 32,4 s; Handle-Section 4,9 s, 58 Faelle = 2 Warmup + 56); MSVC x64 Release `/W4 /WX /analyze` clean. Kein CI-Kostenanstieg gegenueber 389b380 (Gate 32,3 s). Test-only, keine Produkt-/CLI-/ABI-/Packaging-Aenderung.
 - Ersetzt das Adjazenz-Praedikat aus `562ee16`/`389b380`; Branch `agent/coreguard-handle-invariant` bleibt lokal und unpubliziert. Wave 261b (`d3249bc`) ist remote, aber noch ohne PR/CI; Publikation bleibt Owner-Gate.
+
+### 2026-09-28 - Frozen v0.2.0 ABI contract gate
+
+| Feld | Wert |
+|---|---|
+| Agent | OpenCode |
+| Task | Der bestehende layout_manifest-Test pruefte nur 14 von 113 Manifest-Zeilen; Layouts, Enums, Makros und Funktionssignaturen des oeffentlichen Headers konnten sich unbemerkt aendern. Die vollstaendige oeffentliche Oberflaeche des v0.2.0-RC ist jetzt in `tests/abi/contract_v0.2.0.json` digest-versiegelt und wird vom neuen deterministischen MSVC-Gate `tests/test_abi_freeze.py` erzwungen. |
+| Commit | `8448bb8` |
+| Ergebnis | OK - Gate gruen auf unveraendertem RC (4 Tests, 113 frozen entries); 4 Negativ-Kontrollen greifen: Contract-Tamper (Seal- und Diff-FAIL), Makro-Drift `CG_WORKDIR_MAX_CHARS` (FAIL, von In-Header-Static-Asserts nicht abgedeckt), Feld-Reorder `cg_run_result.stdout_utf8/stdout_size` (FAIL ueber Offset-Diff, `sizeof` unveraendert), Signatur-Drift `void -> int cg_run_result_free` (Compile-FAIL via C11 `_Generic`; die Funktionszeiger-Zuweisung allein akzeptiert MSVC kommentarlos). Vollsuite 137 OK (2 skipped), Build clean, Gate-Retry PASS (`blocked_sections: []`). Test-only, keine Produkt-/CLI-/ABI-/Packaging-Aenderung. |
+
+Details:
+
+- Neu: `tests/consumers/abi_signature/main.c` (compile-only, `_Generic`-Static-Assert je oeffentlicher Funktion) und erweiterter `tests/consumers/layout_manifest/main.c` (Enum-/Makro-Werte, `sizeof(cg_status)`, `provenance(msc_ver)`).
+- Vertragssemantik: geaenderte/entfernte Eintraege FAILen immer; neue Eintraege brauchen einen versiegelten `additive_allowlist`-Eintrag; veraltete Allowlist-Eintraege FAILen; unversiegelte Edits FAILen die Digest-Pruefung. Re-Seal als bewusste Zeremonie: `python tests/abi/freeze_abi_contract.py --reason "..."`.
+- Ehrliche Grenze: ein Commit kann Header-Aenderung und Re-Freeze in einem Schritt tun; das Gate macht diesen Schritt sichtbar und review-pflichtig, verhindert ihn nicht mechanisch.
+- Kosten: 2 MSVC-Compiles mit `/analyze`, ca. 11-15 s lokal, keine Library und kein Build noetig; laeuft ueber `unittest discover` in der Windows-CI mit.
+- Transienter Lauf: der erste `tests/verification.py`-Lauf FAILte in der timing-empfindlichen Sleeper-Sektion ("sleeper demonstrated wall-time CPU confusion", seed 12639747); Retry und Vollsuite PASSen. Nicht reproduziert; der test-only Diff kann diesen Pfad nicht beruehren. Als UNGEKLAERT/transient dokumentiert.
+- Nicht verifiziert: GitHub Actions (lokaler MSVC/VS 2026, `_MSC_VER=1950`); Branch `agent/wave265_owned_abi_freeze` bleibt lokal und unpubliziert, Publikation ist Owner-Gate.
