@@ -20,6 +20,7 @@ PUBLIC_HEADER = ROOT / "include" / "coreguard.h"
 PRE_RESOURCE_HEADER = CONSUMERS / "compatibility_pre_resource" / "coreguard.h"
 RESOURCE_LIMIT_HEADER = CONSUMERS / "compatibility_resource_limits" / "coreguard.h"
 VCVARS = os.environ.get("COREGUARD_VCVARS", "vcvars64.bat")
+PACKING_GUARD_MARKER = "Coreguard requires default x64 struct packing"
 
 
 class PublicConsumerTests(unittest.TestCase):
@@ -314,7 +315,7 @@ class PublicConsumerTests(unittest.TestCase):
         )
         try:
             self.assertNotEqual(packed.returncode, 0)
-            self.assertIn("static assertion failed", packed.stdout + packed.stderr)
+            self.assertIn(PACKING_GUARD_MARKER, packed.stdout + packed.stderr)
         finally:
             temporary.cleanup()
 
