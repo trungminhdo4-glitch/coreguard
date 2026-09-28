@@ -94,7 +94,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             "git tag",
         ):
             self.assertNotIn(forbidden, workflow)
-        self.assertIn("runs-on: windows-latest", workflow)
+        self.assertIn("runs-on: windows-2022", workflow)
         self.assertIn("scripts/windows_release_trust.ps1", workflow)
         self.assertIn("actions/upload-artifact@", workflow)
         self.assertNotIn("actions/attest@", workflow)
