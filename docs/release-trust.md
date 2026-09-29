@@ -29,7 +29,7 @@ does not create tags, and a tag push does not publish a GitHub Release.
 ## Pre-merge Windows validation
 
 `.github/workflows/release-trust-ci.yml` is the unprivileged pre-merge path. It
-runs on `windows-latest` with only `contents: read` and uses the same
+runs on `windows-2022` with only `contents: read` and uses the same
 `scripts/windows_release_trust.ps1` and `scripts/release_trust.py` primitives
 as the future release workflow. The hosted runner performs MSVC activation,
 CMake configure, Release build, the existing tests and `verification.py`,

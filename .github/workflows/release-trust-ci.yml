@@ -14,7 +14,7 @@ permissions:
 jobs:
   release-trust-dry-run:
     name: Windows release trust dry run
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 30
     env:
       COREGUARD_DRY_RUN_VERSION: 99.99.99
